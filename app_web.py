@@ -1,28 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-Interfaz Web interactiva con Streamlit para automatización de coberturas médicas.
-Reemplaza a iniciar_gui.py para permitir el uso desde cualquier navegador web.
+Interfaz Web Streamlit adaptada para:
+- Autocompletar datos si la cédula ya existe en la base.
+- Ejecutar el procesamiento asignando carpetas mensuales automáticamente.
 """
 
 import os
 import sys
 import io
-import time
 import datetime
 import pandas as pd
 import streamlit as st
 
-# Importamos las funciones del script backend principal
 import descargar_coberturas as core
 
-# --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(
     page_title="Descarga de Coberturas - CORESALUD",
     page_icon="🏥",
     layout="wide"
 )
 
-# --- CLASE PARA RECOLECTAR MENSAJES Y MOSTRARLOS EN WEB ---
+# Capturador para ver la consola en vivo en la web
 class CapturadorLogs(io.TextIOBase):
     def __init__(self, placeholder_log):
         self.placeholder_log = placeholder_log
@@ -37,199 +35,96 @@ class CapturadorLogs(io.TextIOBase):
     def flush(self):
         pass
 
-# --- TÍTULO PRINCIPAL ---
-st.title("🏥 Descarga de Coberturas Médicas - CORESALUD / IESS")
-st.markdown("Plataforma web para procesamiento de seguros de salud y generación de matrices de atención.")
+st.title("🏥 Descarga de Coberturas Médicas - CORESALUD")
 
-# --- NAVEGACIÓN EN PESTAÑAS ---
-tab_lotes, tab_manual, tab_copia = st.tabs([
+tab_lotes, tab_manual = st.tabs([
     "📂 Procesamiento por Lotes (Excel)",
-    "👤 Ingreso Paciente Manual",
-    "📊 Generar Copia de Matriz"
+    "👤 Ingreso Paciente Manual"
 ])
 
 # ==============================================================================
-# TAB 1: PROCESAMIENTO POR LOTES
+# TAB 1: BATCH / EXCEL
 # ==============================================================================
 with tab_lotes:
-    st.header("Procesamiento Masivo por Lotes")
-    st.write("Sube el archivo Excel con el reporte de inconsistencias o usa el archivo por defecto en el servidor.")
-
-    col1, col2 = st.columns([1, 1])
+    st.header("Procesamiento por Lotes")
+    archivo_subido = st.file_uploader("Subir archivo Excel de inconsistencias", type=["xlsx"])
     
-    with col1:
-        archivo_subido = st.file_uploader("Subir archivo Excel (reporte_inconsistencias.xlsx)", type=["xlsx"])
-        if archivo_subido is not None:
-            # Guardar temporalmente el archivo subido
-            with open(core.ARCHIVO_EXCEL, "wb") as f:
-                f.write(archivo_subido.getbuffer())
-            st.success("¡Archivo cargado correctamente!")
-
-    with col2:
-        if os.path.exists(core.ARCHIVO_EXCEL):
-            try:
-                registros = core.leer_excel(core.ARCHIVO_EXCEL)
-                st.info(f"**Registros encontrados en el archivo:** {len(registros)}")
-            except Exception as e:
-                st.error(f"Error al leer el archivo Excel: {e}")
-        else:
-            st.warning("No se encontró el archivo Excel base en el servidor.")
-
-    st.divider()
+    if archivo_subido is not None:
+        with open(core.ARCHIVO_EXCEL_INCONSISTENCIAS, "wb") as f:
+            f.write(archivo_subido.getbuffer())
+        st.success("Archivo Excel guardado con éxito.")
 
     if st.button("🚀 Iniciar Descarga por Lotes", type="primary"):
-        if not os.path.exists(core.ARCHIVO_EXCEL):
-            st.error("No hay un archivo Excel cargado para procesar.")
-        else:
-            bar_progreso = st.progress(0)
-            status_txt = st.empty()
-            log_container = st.empty()
+        log_container = st.empty()
+        bar_progreso = st.progress(0)
+        
+        capturador = CapturadorLogs(log_container)
+        salida_original = sys.stdout
+        sys.stdout = capturador
 
-            capturador = CapturadorLogs(log_container)
-            salida_original = sys.stdout
-            sys.stdout = capturador
+        try:
+            def callback_progreso(hechos, total):
+                bar_progreso.progress(hechos / total if total > 0 else 0)
 
-            try:
-                def callback_fila(i, estado):
-                    pass
-
-                def callback_progreso(hechos, total):
-                    porcentaje = hechos / total if total > 0 else 0
-                    bar_progreso.progress(porcentaje)
-                    status_txt.text(f"Procesando: {hechos} / {total} pacientes")
-
-                core.main(
-                    callback_fila=callback_fila,
-                    callback_progreso=callback_progreso
-                )
-                st.success("🎉 ¡Procesamiento masivo finalizado con éxito!")
-
-            except Exception as e:
-                st.error(f"Ocurrió un error inesperado durante la ejecución: {e}")
-            finally:
-                sys.stdout = salida_original
+            core.main(callback_progreso=callback_progreso)
+            st.success("🎉 ¡Procesamiento finalizado!")
+        except Exception as e:
+            st.error(f"Error durante la ejecución: {e}")
+        finally:
+            sys.stdout = salida_original
 
 # ==============================================================================
-# TAB 2: INGRESO MANUAL DE PACIENTES
+# TAB 2: INGRESO MANUAL CON BÚSQUEDA AUTOMÁTICA (PUNTO 4)
 # ==============================================================================
 with tab_manual:
     st.header("Ingreso Manual de Pacientes")
-    st.write("Completa los campos para procesar a un paciente específico de manera individual.")
+    st.caption("Si ingresas una cédula registrada anteriormente, el sistema autocompletará sus datos.")
 
-    # Cargar dependencias de la matriz
-    dependencias_validas = []
-    try:
-        ruta_matriz = core.localizar_archivo_matriz()
-        wb_inicial = core.abrir_matriz(ruta_matriz)
-        dependencias_validas = core.obtener_dependencias_validas(wb_inicial)
-    except Exception:
-        dependencias_validas = ["CONSULTA EXTERNA", "EMERGENCIA", "HOSPITALIZACION"]
+    cedula_ingresada = st.text_input("Cédula del Paciente (10 dígitos)*", max_chars=10)
+    
+    # Búsqueda en el historial guardado (Punto 4)
+    paciente_encontrado = None
+    if len(cedula_ingresada) == 10:
+        paciente_encontrado = core.buscar_paciente_historial(cedula_ingresada)
+        if paciente_encontrado:
+            st.info(f"✨ ¡Paciente registrado anteriormente!: {paciente_encontrado.get('apellidos', '')} {paciente_encontrado.get('nombres', '')}")
 
-    with st.form("form_paciente", clear_on_submit=False):
+    with st.form("form_paciente"):
         c1, c2 = st.columns(2)
         with c1:
-            responsable = st.text_input("Responsable (quien ingresa la información)*")
-            cedula = st.text_input("Cédula del Paciente (10 dígitos)*", max_chars=10)
-            fecha_atencion = st.date_input("Fecha de atención*", value=datetime.date.today())
-            dependencia = st.selectbox("Dependencia (tipo de consulta)*", dependencias_validas)
+            responsable = st.text_input("Responsable", value="ADMIN")
+            fecha_atencion = st.date_input("Fecha de atención", value=datetime.date.today())
+            dependencia = st.selectbox("Dependencia", ["MEDICINA GENERAL (CE)", "EMERGENCIA", "HOSPITALIZACION"])
 
         with c2:
-            fecha_nacimiento = st.date_input("Fecha de nacimiento", value=datetime.date(1990, 1, 1))
-            sexo = st.selectbox("Sexo", ["Masculino", "Femenino"])
-            observaciones = st.text_area("Observaciones (opcional)")
+            nombres = st.text_input("Nombres", value=paciente_encontrado.get("nombres", "") if paciente_encontrado else "")
+            apellidos = st.text_input("Apellidos", value=paciente_encontrado.get("apellidos", "") if paciente_encontrado else "")
+            sexo = st.selectbox("Sexo", ["Masculino", "Femenino"], index=0 if (not paciente_encontrado or paciente_encontrado.get("sexo")=="M") else 1)
 
-        btn_procesar_manual = st.form_submit_button("⚙️ Procesar Paciente Manual", type="primary")
+        btn_procesar = st.form_submit_button("⚙️ Procesar Paciente", type="primary")
 
-    if btn_procesar_manual:
-        cedula_limpia = "".join(filter(str.isdigit, cedula)).zfill(10)
-
-        if not responsable.strip():
-            st.error("Por favor, ingresa el nombre del responsable.")
-        elif len(cedula_limpia) != 10:
-            st.error("La cédula ingresada debe contener 10 dígitos numéricos.")
+    if btn_procesar:
+        if len(cedula_ingresada) != 10:
+            st.error("Ingresa una cédula válida de 10 dígitos.")
         else:
-            st.info(f"Procesando cédula: {cedula_limpia}...")
-
-            reg_manual = {
-                "responsable": responsable.strip(),
-                "cedula": cedula_limpia,
+            datos_paciente = {
+                "cedula": cedula_ingresada,
+                "nombres": nombres,
+                "apellidos": apellidos,
                 "fecha_atencion": fecha_atencion.strftime("%Y-%m-%d"),
                 "dependencia": dependencia,
-                "fecha_nacimiento": fecha_nacimiento.strftime("%Y-%m-%d") if fecha_nacimiento else "",
-                "sexo": "M" if sexo == "Masculino" else "F",
-                "observaciones": observaciones.strip()
+                "sexo": "M" if sexo == "Masculino" else "F"
             }
 
-            log_manual = st.empty()
-            capturador = CapturadorLogs(log_manual)
+            log_box = st.empty()
+            capturador = CapturadorLogs(log_box)
             salida_original = sys.stdout
             sys.stdout = capturador
 
             try:
-                # Se prepara la estructura de datos que espera el script principal
-                pacientes_manuales = [reg_manual]
-                
-                st.write("Consolidando información del paciente...")
-                
-                # Ejecuta la función principal pasándole el registro del paciente
-                if hasattr(core, 'procesar_lista_pacientes'):
-                    core.procesar_lista_pacientes(pacientes_manuales)
-                elif hasattr(core, 'procesar_paciente'):
-                    core.procesar_paciente(reg_manual)
-                else:
-                    core.main()
-                    
+                core.procesar_paciente(datos_paciente)
                 st.success("✅ Paciente procesado con éxito.")
             except Exception as e:
                 st.error(f"Error procesando al paciente: {e}")
-
-# ==============================================================================
-# TAB 3: GENERAR COPIA DE MATRIZ
-# ==============================================================================
-with tab_copia:
-    st.header("Generar Copia / Descargar Matriz")
-    st.write("Filtra y genera reportes consolidados en formato Excel.")
-
-    modo = st.radio("¿Qué deseas copiar?", ["todo", "hoy", "mes", "rango"], format_func=lambda x: {
-        "todo": "Todo el registro",
-        "hoy": "Solo las atenciones de hoy",
-        "mes": "Un mes completo",
-        "rango": "Rango personalizado de fechas"
-    }[x])
-
-    fecha_desde, fecha_hasta = None, None
-
-    if modo == "mes":
-        fecha_mes = st.date_input("Selecciona un día del mes deseado", value=datetime.date.today())
-        fecha_desde = fecha_mes
-    elif modo == "rango":
-        c_d, c_h = st.columns(2)
-        with c_d:
-            fecha_desde = st.date_input("Desde", value=datetime.date.today())
-        with c_h:
-            fecha_hasta = st.date_input("Hasta", value=datetime.date.today())
-
-    if st.button("📥 Generar y Descargar Archivo Excel"):
-        try:
-            carpeta_temp = os.path.abspath("./descargas_temp")
-            os.makedirs(carpeta_temp, exist_ok=True)
-
-            f_desde = fecha_desde.strftime("%d-%m-%Y") if fecha_desde else None
-            f_hasta = fecha_hasta.strftime("%d-%m-%Y") if fecha_hasta else None
-
-            destino = core.generar_copia_matriz(
-                carpeta_destino=carpeta_temp,
-                modo_fecha=modo,
-                fecha_desde=f_desde,
-                fecha_hasta=f_hasta
-            )
-
-            with open(destino, "rb") as file:
-                st.download_button(
-                    label="⬇️ Descargar Copia Excel Generada",
-                    data=file,
-                    file_name=os.path.basename(destino),
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-        except Exception as e:
-            st.error(f"Error generando la copia del Excel: {e}")
+            finally:
+                sys.stdout = salida_original
