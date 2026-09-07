@@ -166,13 +166,22 @@ with tab_manual:
             sys.stdout = capturador
 
             try:
-                res_iess = core.consultar_iess(cedula_limpia, fecha_atencion.strftime("%d-%m-%Y"))
+                # Se prepara la estructura de datos que espera el script principal
+                pacientes_manuales = [reg_manual]
+                
                 st.write("Consolidando información del paciente...")
+                
+                # Ejecuta la función principal pasándole el registro del paciente
+                if hasattr(core, 'procesar_lista_pacientes'):
+                    core.procesar_lista_pacientes(pacientes_manuales)
+                elif hasattr(core, 'procesar_paciente'):
+                    core.procesar_paciente(reg_manual)
+                else:
+                    core.main()
+                    
                 st.success("✅ Paciente procesado con éxito.")
             except Exception as e:
                 st.error(f"Error procesando al paciente: {e}")
-            finally:
-                sys.stdout = salida_original
 
 # ==============================================================================
 # TAB 3: GENERAR COPIA DE MATRIZ
