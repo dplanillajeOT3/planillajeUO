@@ -1,6 +1,15 @@
 # -*- coding: utf-8 -*-
 
 """
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+
+# Apunta directamente al ejecutable local sin llamar a ChromeDriverManager()
+service = Service(executable_path='./chromedriver.exe')
+driver = webdriver.Chrome(service=service)
+# Apunta directamente al ejecutable local sin llamar a ChromeDriverManager()
+service = Service(executable_path='./chromedriver.exe')
+driver = webdriver.Chrome(service=service)
 DESCARGA AUTOMATICA DE PDFs DE COBERTURA DE SALUD DESDE CORESALUD
 
 Lee cedulas y fechas desde un archivo Excel y consulta:
@@ -63,6 +72,7 @@ import json
 import base64
 import shutil
 import unicodedata
+import contextlib
 from datetime import date, datetime, timedelta
 
 import openpyxl
@@ -370,6 +380,20 @@ def _instalar_chromedriver(reintentos=3):
 
 
 def crear_driver(carpeta_descargas):
+    # Rutas tipicas del navegador y su driver cuando se instalan por apt
+    # en un contenedor Linux (Streamlit Community Cloud, Render, etc,
+    # via un archivo "packages.txt" con "chromium" y "chromium-driver").
+    # Si existen, se usan directamente -mas rapido y confiable que dejar
+    # que webdriver_manager intente detectar la version del navegador el
+    # mismo-. Si no existen (por ejemplo en la PC de escritorio con
+    # Windows), se sigue exactamente igual que siempre.
+    _RUTAS_CHROMIUM = ("/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome")
+    _RUTAS_CHROMEDRIVER = (
+        "/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver", "/usr/lib/chromium-browser/chromedriver"
+    )
+    binario_chromium = next((r for r in _RUTAS_CHROMIUM if os.path.exists(r)), None)
+    ruta_chromedriver_sistema = next((r for r in _RUTAS_CHROMEDRIVER if os.path.exists(r)), None)
+
     opciones = webdriver.ChromeOptions()
     prefs = {
         "download.default_directory": os.path.abspath(carpeta_descargas),
@@ -381,6 +405,9 @@ def crear_driver(carpeta_descargas):
     opciones.add_experimental_option("prefs", prefs)
     opciones.add_argument("--disable-popup-blocking")
 
+    if binario_chromium:
+        opciones.binary_location = binario_chromium
+
     # Fuerza una escala de renderizado fija (1.0), sin importar la escala
     # de pantalla/DPI configurada en Windows en cada PC (Windows 11 suele
     # traer 125%/150% por defecto en pantallas nuevas, Windows 10 a veces
@@ -391,7 +418,9 @@ def crear_driver(carpeta_descargas):
     opciones.add_argument("--high-dpi-support=1")
 
     # Reduce diferencias de compatibilidad entre instalaciones de Windows
-    # (permisos, perfiles nuevos, antivirus/politicas locales).
+    # (permisos, perfiles nuevos, antivirus/politicas locales), y es
+    # obligatorio ademas para correr como root dentro de un contenedor
+    # Linux (Streamlit Cloud, Render, etc).
     opciones.add_argument("--no-sandbox")
     opciones.add_argument("--disable-dev-shm-usage")
 
@@ -400,8 +429,12 @@ def crear_driver(carpeta_descargas):
         opciones.add_argument("--window-size=1400,1000")
         opciones.add_argument("--disable-gpu")
 
-    _limpiar_lock_wdm()
-    servicio = Service(_instalar_chromedriver())
+    if ruta_chromedriver_sistema:
+        servicio = Service(ruta_chromedriver_sistema)
+    else:
+        _limpiar_lock_wdm()
+        servicio = Service(_instalar_chromedriver())
+
     driver = webdriver.Chrome(service=servicio, options=opciones)
     driver.set_script_timeout(20)
 
@@ -2292,20 +2325,39 @@ def _guardar_reportes_finales(errores, sin_seguro):
 # ============================================================
 
 def procesar_lote(items, driver_holder, carpeta_descargas_temp, carpeta_diagnostico,
-                   errores, sin_seguro, callback_fila=None, callback_progreso=None):
+                   errores, sin_seguro, callback_fila=None, callback_progreso=None,
+                   escribir_matriz=False, responsable_matriz=None):
     """Procesa una lista de (indice_original, registro): la primera vez
     es el lote completo leido del Excel, y tambien se usa para
     reintentar solo un subconjunto (las filas que fallaron) desde la
     interfaz, sin tener que repetir todo el lote. 'errores' y
     'sin_seguro' reciben los resultados (se espera que estas listas ya
     traigan lo acumulado de corridas anteriores, si aplica, para que el
-    reporte final no pierda nada)."""
+    reporte final no pierda nada).
+
+    Si 'escribir_matriz' es True, cada paciente procesado que SI tiene
+    seguro tambien se agrega a la matriz de Excel DEL MES QUE LE
+    CORRESPONDA segun su fecha de atencion (nunca se mezclan fechas de
+    meses distintos en el mismo archivo), con Dependencia, fecha de
+    nacimiento y sexo EN BLANCO (el modo por lotes no trae esos datos;
+    se completan despues a mano) y 'responsable_matriz' como Responsable
+    en todas las filas. Si 'escribir_matriz' es False (por defecto), el
+    comportamiento es igual que antes: solo se descargan los PDF, sin
+    tocar la matriz."""
     total = len(items)
     for n, (indice, reg) in enumerate(items, start=1):
-        procesar_registro(
+        filas_matriz = procesar_registro(
             reg, indice, total, driver_holder, carpeta_descargas_temp, carpeta_diagnostico,
-            errores, sin_seguro, callback_fila=callback_fila
+            errores, sin_seguro, callback_fila=callback_fila, recolectar_matriz=escribir_matriz
         )
+        if escribir_matriz and filas_matriz:
+            try:
+                agregar_filas_matriz_con_bloqueo(
+                    filas_matriz, "", None, "", "", responsable_matriz or ""
+                )
+            except TimeoutError as e:
+                print(f"   ERROR guardando en la matriz: {e}")
+                errores.append([reg.get("nombre") or reg["cedula"], reg["cedula"], "", f"(MATRIZ) {e}"])
         if callback_progreso:
             callback_progreso(n, total)
 
@@ -2478,55 +2530,118 @@ def _clonar_matriz_para_mes_actual(ruta_base, fecha_actual):
           f"   (a partir de: {os.path.basename(ruta_base)})")
     return ruta_nueva
 
+_SUFIJO_LOCK_DATOS_PACIENTES = ".lock"
+
+@contextlib.contextmanager
+def _bloqueo_datos_pacientes(timeout=15):
+    """Mismo mecanismo de candado que se usa para la matriz (ver
+    bloqueo_matriz), aplicado a datos_pacientes.json: evita que dos PC
+    (o dos ventanas abiertas al mismo tiempo) que comparten este archivo
+    por red se pisen entre si al guardar. ANTES, si dos PC guardaban
+    casi al mismo tiempo, la ultima en guardar podia sobrescribir el
+    archivo entero solo con lo que ella tenia en memoria, borrando sin
+    querer los pacientes que la otra PC acababa de agregar."""
+    ruta_lock = RUTA_DATOS_PACIENTES + _SUFIJO_LOCK_DATOS_PACIENTES
+    fin = time.time() + timeout
+    adquirido = False
+    while time.time() < fin:
+        try:
+            fd = os.open(ruta_lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            adquirido = True
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(ruta_lock) > 30:
+                    os.remove(ruta_lock)
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.2)
+    try:
+        yield
+    finally:
+        if adquirido:
+            try:
+                os.remove(ruta_lock)
+            except OSError:
+                pass
+
 def _cargar_datos_pacientes():
+    """Lee datos_pacientes.json. Si el archivo no existe todavia (nunca
+    se ha guardado nadie), devuelve un diccionario vacio -eso es normal.
+    Si el archivo SI existe pero no se pudo leer o esta corrupto, lanza
+    la excepcion en vez de devolver un diccionario vacio en silencio:
+    devolver vacio ahi seria peligroso, porque un guardado inmediatamente
+    despues sobrescribiria el archivo real con uno casi vacio, borrando
+    todo lo que ya se tenia guardado."""
     if not os.path.exists(RUTA_DATOS_PACIENTES):
         return {}
-    try:
-        with open(RUTA_DATOS_PACIENTES, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    with open(RUTA_DATOS_PACIENTES, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 def _guardar_datos_pacientes(datos):
-    try:
-        with open(RUTA_DATOS_PACIENTES, "w", encoding="utf-8") as f:
-            json.dump(datos, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"   AVISO: no se pudo guardar el archivo de datos de pacientes ({RUTA_DATOS_PACIENTES}): {e}")
+    with open(RUTA_DATOS_PACIENTES, "w", encoding="utf-8") as f:
+        json.dump(datos, f, ensure_ascii=False, indent=2)
 
 def obtener_datos_guardados_paciente(cedula):
     """Devuelve un dict con los datos que se recuerdan de esta cedula de
     una vez anterior (nombre, fecha_nacimiento como texto DD-MM-YYYY,
-    sexo como 'M'/'F'), o None si es la primera vez que se ve."""
-    return _cargar_datos_pacientes().get(cedula)
+    sexo como 'M'/'F'), o None si es la primera vez que se ve, o si el
+    archivo no se pudo leer en este momento (por ejemplo, otra PC lo
+    esta guardando justo ahora)."""
+    try:
+        with _bloqueo_datos_pacientes():
+            return _cargar_datos_pacientes().get(cedula)
+    except Exception as e:
+        print(f"   AVISO: no se pudieron leer los datos guardados de pacientes ({RUTA_DATOS_PACIENTES}): {e}")
+        return None
 
 def guardar_datos_paciente(cedula, nombre=None, fecha_nacimiento=None, sexo=None):
     """Recuerda estos datos de la cedula para la proxima vez que se
     ingrese, para no tener que volver a escribirlos. Solo actualiza los
     campos que se pasen (los que sean None/vacios no se tocan, no borran
-    lo que ya estaba guardado)."""
-    datos = _cargar_datos_pacientes()
-    actual = datos.get(cedula, {})
-    if nombre:
-        actual["nombre"] = nombre
-    if fecha_nacimiento:
-        actual["fecha_nacimiento"] = (
-            fecha_nacimiento.strftime("%d-%m-%Y") if hasattr(fecha_nacimiento, "strftime") else fecha_nacimiento
-        )
-    if sexo:
-        actual["sexo"] = sexo
-    datos[cedula] = actual
-    _guardar_datos_pacientes(datos)
+    lo que ya estaba guardado). Toma el candado del archivo mientras lee
+    y vuelve a guardar, para que dos PC no se pisen entre si; si por
+    algun motivo no se puede leer el archivo existente con seguridad,
+    NO se guarda nada esta vez (mejor perder este ultimo dato que
+    arriesgarse a borrar todo lo demas que ya estaba guardado)."""
+    try:
+        with _bloqueo_datos_pacientes():
+            datos = _cargar_datos_pacientes()
+            actual = datos.get(cedula, {})
+            if nombre:
+                actual["nombre"] = nombre
+            if fecha_nacimiento:
+                actual["fecha_nacimiento"] = (
+                    fecha_nacimiento.strftime("%d-%m-%Y") if hasattr(fecha_nacimiento, "strftime")
+                    else fecha_nacimiento
+                )
+            if sexo:
+                actual["sexo"] = sexo
+            datos[cedula] = actual
+            _guardar_datos_pacientes(datos)
+    except Exception as e:
+        print(f"   AVISO: no se pudieron guardar los datos de la cedula {cedula} para la proxima vez: {e}")
 
-def localizar_archivo_matriz():
-    """Devuelve la ruta del archivo de la matriz del MES ACTUAL. Ya NO
-    hace falta subirlo a mano cada mes: si no existe todavia un archivo
-    para el mes en curso, se genera solo clonando la estructura del
-    archivo INSTRUCTIVO...xlsx mas reciente que ya exista en la carpeta
-    del script (ver _clonar_matriz_para_mes_actual). Solo hay que subir
-    el Excel una vez; de ahi en adelante cada mes se encadena solo a
-    partir del anterior, heredando cualquier cambio que se le haga."""
-    if os.path.exists(ARCHIVO_MATRIZ):
+def localizar_archivo_matriz(fecha=None):
+    """Devuelve la ruta del archivo de la matriz del MES DE 'fecha' (por
+    defecto, el mes actual si no se indica). Ya NO hace falta subirlo a
+    mano cada mes, NI mezclar en el mismo archivo pacientes de meses
+    distintos: si no existe todavia un archivo para ese mes puntual, se
+    genera solo clonando la estructura del archivo INSTRUCTIVO...xlsx
+    mas reciente que ya exista en la carpeta del script (ver
+    _clonar_matriz_para_mes_actual). Solo hay que subir el Excel una
+    vez; de ahi en adelante cada mes que haga falta (incluido uno
+    anterior, si se ingresa una fecha de atencion atrasada) se genera
+    solo a partir del mas reciente que ya exista, heredando cualquier
+    cambio que se le haya hecho."""
+    fecha = fecha or date.today()
+    patron_mes_pedido = re.compile(
+        re.escape(nombre_mes_es(fecha)) + r"[ _-]*" + re.escape(str(fecha.year)), re.IGNORECASE
+    )
+
+    if os.path.exists(ARCHIVO_MATRIZ) and patron_mes_pedido.search(os.path.basename(ARCHIVO_MATRIZ).upper()):
         return ARCHIVO_MATRIZ
 
     candidatos = []
@@ -2542,29 +2657,25 @@ def localizar_archivo_matriz():
     if not candidatos:
         raise FileNotFoundError(
             "No se encontro ningun archivo 'INSTRUCTIVO...xlsx' en la carpeta del script:\n"
-            f"{BASE_DIR}\nSube uno (una sola vez) para que sirva de base; los meses "
-            "siguientes se generaran solos a partir de el."
+            f"{BASE_DIR}\nSube uno (una sola vez) para que sirva de base; los demas meses "
+            "se generaran solos a partir de el."
         )
 
     candidatos.sort(key=os.path.getmtime, reverse=True)
 
-    # ¿Ya existe, por nombre, un archivo del mes actual entre los
+    # ¿Ya existe, por nombre, un archivo del mes pedido entre los
     # candidatos? (ej. si alguien lo subio a mano igual, o ya se genero
-    # antes en una corrida anterior de hoy).
-    hoy = date.today()
-    patron_mes_actual = re.compile(
-        re.escape(nombre_mes_es(hoy)) + r"[ _-]*" + re.escape(str(hoy.year)), re.IGNORECASE
-    )
+    # antes en una corrida anterior).
     for ruta in candidatos:
-        if patron_mes_actual.search(os.path.basename(ruta).upper()):
+        if patron_mes_pedido.search(os.path.basename(ruta).upper()):
             return ruta
 
     if len(candidatos) > 1:
         print("AVISO: se encontro mas de un archivo INSTRUCTIVO...xlsx en la carpeta del "
               "script; se usara el modificado mas recientemente como base para generar "
-              "el mes actual: " + os.path.basename(candidatos[0]))
+              f"la matriz de {nombre_carpeta_mes(fecha)}: " + os.path.basename(candidatos[0]))
 
-    return _clonar_matriz_para_mes_actual(candidatos[0], hoy)
+    return _clonar_matriz_para_mes_actual(candidatos[0], fecha)
 
 def _hacer_respaldo_matriz(ruta):
     os.makedirs(CARPETA_RESPALDOS_MATRIZ, exist_ok=True)
@@ -2782,6 +2893,40 @@ def asegurar_formulas_fila(ws, fila_objetivo):
         nueva_formula = Translator(formula_origen, origin=celda_origen).translate_formula(celda_destino)
         ws.cell(row=fila_objetivo, column=columna).value = nueva_formula
 
+def _normalizar_fecha_celda(valor):
+    """Convierte lo que venga en una celda de fecha (datetime, date, o
+    texto DD/MM/YYYY) a un date de Python, para poder comparar fechas
+    sin importar como haya quedado guardado el valor."""
+    if valor in (None, ""):
+        return None
+    if isinstance(valor, datetime):
+        return valor.date()
+    if isinstance(valor, date):
+        return valor
+    return _parsear_fecha_flexible(str(valor))
+
+def existe_fila_matriz(ws, cedula, fecha_atencion, dependencia):
+    """True si ya hay una fila en la matriz con esta MISMA cedula de
+    paciente (columna H), esta MISMA fecha de atencion (columna E) Y
+    esta MISMA dependencia (columna B). Se usa para no duplicar al
+    paciente si se lo vuelve a ingresar para la misma fecha Y la misma
+    dependencia; si cambia la fecha de atencion O la dependencia (por
+    ejemplo, la misma fecha pero otra consulta distinta), SI debe
+    quedar como una fila nueva."""
+    cedula = str(cedula).strip()
+    fecha_atencion = _normalizar_fecha_celda(fecha_atencion)
+    dependencia = str(dependencia or "").strip().upper()
+    fila = 2
+    while ws.cell(row=fila, column=COL_MATRIZ_CEDULA).value not in (None, ""):
+        cedula_fila = str(ws.cell(row=fila, column=COL_MATRIZ_CEDULA).value or "").strip()
+        if cedula_fila == cedula:
+            fecha_fila = _normalizar_fecha_celda(ws.cell(row=fila, column=5).value)
+            dependencia_fila = str(ws.cell(row=fila, column=2).value or "").strip().upper()
+            if fecha_fila == fecha_atencion and dependencia_fila == dependencia:
+                return True
+        fila += 1
+    return False
+
 def agregar_fila_matriz(ws, info, dependencia, fecha_nacimiento, sexo, observaciones, responsable):
     """Escribe una fila nueva en MES_2026 con lo que ya determino el
     motor de descarga (institucion, cedula/nombre del paciente, fecha de
@@ -2790,6 +2935,12 @@ def agregar_fila_matriz(ws, info, dependencia, fecha_nacimiento, sexo, observaci
     fecha de nacimiento, sexo, observaciones, responsable). El CIE10 y
     "primera/subsecuente" y "diagnostico presuntivo/definitivo" se dejan
     en blanco a proposito (se completan en otro proceso).
+
+    Si esta MISMA cedula de paciente YA tiene una fila con esta MISMA
+    fecha de atencion Y esta MISMA dependencia, no se agrega una fila
+    duplicada -se devuelve None-; si cambia la fecha de atencion o la
+    dependencia (otra visita, u otra consulta el mismo dia), SI se
+    agrega normalmente.
 
     Las columnas con formula de la plantilla (codigo de dependencia,
     numero de expediente, codigo de tipo de seguro, edad, duracion,
@@ -2800,6 +2951,9 @@ def agregar_fila_matriz(ws, info, dependencia, fecha_nacimiento, sexo, observaci
     es titular; cuando no lo es, hay que poner los datos reales del
     titular/acreditador que el motor de descarga ya identifico.
     """
+    if existe_fila_matriz(ws, info["cedula_paciente"], info["fecha_atencion"], dependencia):
+        return None
+
     fila = siguiente_fila_matriz(ws)
     asegurar_formulas_fila(ws, fila)
 
@@ -2822,8 +2976,6 @@ def agregar_fila_matriz(ws, info, dependencia, fecha_nacimiento, sexo, observaci
     ws.cell(row=fila, column=23, value=responsable)                                # W
 
     return fila
-
-import contextlib
 
 _SUFIJO_LOCK_MATRIZ = ".lock"
 
@@ -2877,27 +3029,51 @@ def bloqueo_matriz(ruta_matriz, timeout=30):
         except OSError:
             pass
 
-def agregar_filas_matriz_con_bloqueo(ruta_matriz, filas_info, dependencia, fecha_nacimiento,
+def agregar_filas_matriz_con_bloqueo(filas_info, dependencia, fecha_nacimiento,
                                       sexo, observaciones, responsable):
-    """Version seguridad-para-red de agregar_fila_matriz: toma el
-    candado de la matriz, vuelve a abrir el archivo TAL COMO ESTA en
-    ese momento (no una copia vieja que se haya quedado en memoria de
-    antes), agrega ahi las filas nuevas, y guarda -- todo mientras
-    ninguna otra PC puede escribir al mismo tiempo. Esto es lo que
-    evita que dos PC usando la matriz a la vez se borren los cambios
-    entre si. Devuelve la lista de numeros de fila que quedaron
-    escritas."""
-    filas_escritas = []
-    with bloqueo_matriz(ruta_matriz):
-        wb = abrir_matriz(ruta_matriz)
-        ws = wb[HOJA_MATRIZ]
-        for info in filas_info:
-            fila = agregar_fila_matriz(
-                ws, info, dependencia, fecha_nacimiento, sexo, observaciones, responsable
-            )
-            filas_escritas.append(fila)
-        wb.save(ruta_matriz)
-    return filas_escritas
+    """Version segura-para-red de agregar_fila_matriz: agrega cada fila
+    a la matriz DEL MES QUE LE CORRESPONDE segun su propia fecha de
+    atencion -nunca fuerza todo al mes actual-, para que fechas de
+    meses distintos jamas se mezclen en el mismo archivo; si hace falta,
+    esa matriz mensual se genera sola (ver localizar_archivo_matriz).
+    Agrupa las filas por mes para abrir/guardar cada archivo una sola
+    vez, y toma el candado de cada uno mientras escribe -- asi dos PC
+    usando la matriz al mismo tiempo nunca se borran los cambios entre
+    si. Si alguna fila es un duplicado exacto (misma cedula, misma
+    fecha de atencion Y misma dependencia) de una que ya esta en la
+    matriz de ese mes, se salta -no se agrega de nuevo-; si cambia la
+    fecha o la dependencia, SI se agrega como fila nueva. Devuelve la
+    lista de (ruta_matriz, numero_de_fila) de las filas que quedaron
+    escritas (sin contar los duplicados saltados)."""
+    grupos = {}
+    orden_rutas = []
+    for info in filas_info:
+        ruta_matriz = localizar_archivo_matriz(info["fecha_atencion"])
+        if ruta_matriz not in grupos:
+            grupos[ruta_matriz] = []
+            orden_rutas.append(ruta_matriz)
+        grupos[ruta_matriz].append(info)
+
+    resultados = []
+    for ruta_matriz in orden_rutas:
+        filas_escritas_aqui = []
+        with bloqueo_matriz(ruta_matriz):
+            wb = abrir_matriz(ruta_matriz)
+            ws = wb[HOJA_MATRIZ]
+            for info in grupos[ruta_matriz]:
+                fila = agregar_fila_matriz(
+                    ws, info, dependencia, fecha_nacimiento, sexo, observaciones, responsable
+                )
+                if fila is None:
+                    print(f"   (Ya existe una fila para la cedula {info['cedula_paciente']} con fecha "
+                          f"{info['fecha_atencion'].strftime('%d-%m-%Y')} y esta misma dependencia; "
+                          "no se duplica.)")
+                    continue
+                filas_escritas_aqui.append(fila)
+                resultados.append((ruta_matriz, fila))
+            if filas_escritas_aqui:
+                wb.save(ruta_matriz)
+    return resultados
 
 # ============================================================
 # MODO MANUAL / INTERACTIVO (un paciente a la vez)
@@ -2922,8 +3098,12 @@ def modo_interactivo():
         # agregando pacientes a la misma matriz por red, la que guarde
         # de ultimo terminaria borrando lo que la otra ya escribio. Cada
         # fila se agrega releyendo el archivo tal como este en ese
-        # momento (ver agregar_filas_matriz_con_bloqueo mas abajo).
+        # momento, y en la matriz del MES QUE LE CORRESPONDA segun su
+        # propia fecha de atencion (ver agregar_filas_matriz_con_bloqueo
+        # mas abajo), no siempre esta del mes actual.
         dependencias_validas = obtener_dependencias_validas(abrir_matriz(ruta_matriz))
+
+    hay_matriz_disponible = ruta_matriz is not None
 
     responsable = _preguntar("Nombre del responsable (persona que ingresa la informacion): ").upper()
 
@@ -2993,10 +3173,10 @@ def modo_interactivo():
                 cedula, nombre=reg.get("nombre"), fecha_nacimiento=fecha_nacimiento, sexo=sexo
             )
 
-            if ruta_matriz is not None and filas_matriz:
+            if hay_matriz_disponible and filas_matriz:
                 try:
                     filas_escritas = agregar_filas_matriz_con_bloqueo(
-                        ruta_matriz, filas_matriz, dependencia, fecha_nacimiento,
+                        filas_matriz, dependencia, fecha_nacimiento,
                         sexo, observaciones, responsable
                     )
                 except TimeoutError as e:
@@ -3005,8 +3185,8 @@ def modo_interactivo():
                                      f"(MATRIZ) {e}"])
                 else:
                     filas_agregadas += len(filas_escritas)
-                    for fila in filas_escritas:
-                        print(f"   -> Fila {fila} agregada a la matriz ({HOJA_MATRIZ}).")
+                    for ruta_matriz_fila, fila in filas_escritas:
+                        print(f"   -> Fila {fila} agregada a la matriz ({os.path.basename(ruta_matriz_fila)}).")
 
             if not pedir_confirmacion("\n¿Deseas ingresar otro paciente? (S/N): "):
                 break
@@ -3019,8 +3199,9 @@ def modo_interactivo():
 
     _guardar_reportes_finales(errores, sin_seguro)
 
-    if ruta_matriz is not None and filas_agregadas > 0:
-        print(f"\nSe guardaron {filas_agregadas} fila(s) en el archivo de la matriz:\n{ruta_matriz}")
+    if hay_matriz_disponible and filas_agregadas > 0:
+        print(f"\nSe guardaron {filas_agregadas} fila(s) en la(s) matriz(ces) correspondiente(s) "
+              "(cada una en el archivo del mes de su fecha de atencion).")
 
         if pedir_confirmacion("¿Deseas generar una copia del archivo de la matriz en este momento? (S/N): "):
             print("   ¿Que quieres copiar?")
