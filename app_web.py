@@ -27,6 +27,7 @@ import time
 import uuid
 import queue
 import zipfile
+import tempfile
 import threading
 import contextlib
 import traceback
@@ -119,8 +120,12 @@ if st.session_state.auth_unidad is None:
 # sola vez (mas abajo se le pide si todavia no lo tiene).
 # ------------------------------------------------------------------
 _UNIDAD = st.session_state.auth_unidad
-_CARPETA_BASE_ORIGINAL = motor.BASE_DIR
-_carpeta_unidad = os.path.join(_CARPETA_BASE_ORIGINAL, "DATOS_UNIDADES", _UNIDAD)
+# OJO: motor.BASE_DIR apunta a la carpeta del codigo fuente (clonado de
+# GitHub), que en Streamlit Cloud es de SOLO LECTURA. Los datos de cada
+# unidad se guardan en la carpeta temporal del sistema (siempre
+# escribible), separada del codigo.
+_CARPETA_BASE_ORIGINAL = tempfile.gettempdir()
+_carpeta_unidad = os.path.join(_CARPETA_BASE_ORIGINAL, "planillaje_datos", "DATOS_UNIDADES", _UNIDAD)
 os.makedirs(_carpeta_unidad, exist_ok=True)
 
 motor.BASE_DIR = _carpeta_unidad
