@@ -1,231 +1,166 @@
+# -*- coding: utf-8 -*-
+"""
+Interfaz Web para ejecutar descargar_coberturas.py desde un navegador.
+
+COMO USARLO:
+    streamlit run app_web.py
+"""
+
 import os
-import shutil
-import zipfile
-import time
-from datetime import datetime
-import pandas as pd
+import sys
+import queue
+import threading
+from datetime import date
 import streamlit as st
+import descargar_coberturas as core
 
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+# Configuración de la página
+st.set_page_config(
+    page_title="Descarga de Coberturas - CORESALUD (Web)",
+    page_icon="🏥",
+    layout="wide"
+)
 
-# -----------------------------------------------------------------------------
-# 1. CONFIGURACIÓN DEL DRIVER SELENIUM EN NUBE (HEADLESS)
-# -----------------------------------------------------------------------------
-def crear_driver(carpeta_descargas):
-    os.makedirs(carpeta_descargas, exist_ok=True)
-    
-    RUTAS_CHROMIUM = ("/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome")
-    RUTAS_CHROMEDRIVER = ("/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver", "/usr/lib/chromium-browser/chromedriver")
-    
-    binario_chromium = next((r for r in RUTAS_CHROMIUM if os.path.exists(r)), None)
-    ruta_driver_sistema = next((r for r in RUTAS_CHROMEDRIVER if os.path.exists(r)), None)
+st.title("🏥 Sistema de Coberturas Médicas")
 
-    opciones = webdriver.ChromeOptions()
-    prefs = {
-        "download.default_directory": os.path.abspath(carpeta_descargas),
-        "download.prompt_for_download": False,
-        "download.directory_upgrade": True,
-        "plugins.always_open_pdf_externally": True,
-        "profile.default_content_setting_values.automatic_downloads": 1
-    }
-    opciones.add_experimental_option("prefs", prefs)
+# --- Estado de Sesión (Session State) ---
+if "log_texto" not in st.session_state:
+    st.session_state.log_texto = ""
+if "pacientes_cola" not in st.session_state:
+    st.session_state.pacientes_cola = []
+if "ejecutando" not in st.session_state:
+    st.session_state.ejecutando = False
 
-    opciones.add_argument("--headless=new")
-    opciones.add_argument("--no-sandbox")
-    opciones.add_argument("--disable-dev-shm-usage")
-    opciones.add_argument("--disable-gpu")
-    opciones.add_argument("--window-size=1920,1080")
-
-    if binario_chromium:
-        opciones.binary_location = binario_chromium
-
-    if ruta_driver_sistema:
-        servicio = Service(ruta_driver_sistema)
-    else:
-        servicio = Service(ChromeDriverManager().install())
-
-    driver = webdriver.Chrome(service=servicio, options=opciones)
-    
-    try:
-        driver.execute_cdp_cmd("Page.setDownloadBehavior", {
-            "behavior": "allow",
-            "downloadPath": os.path.abspath(carpeta_descargas)
-        })
-    except Exception:
-        pass
-
-    return driver
+# Sidebar / Menú Lateral
+st.sidebar.header("Opciones del Sistema")
+modo = st.sidebar.radio("Selecciona el Modo:", ["Lote (Desde Excel)", "Ingreso Manual", "Generar Copia Excel"])
 
 
-# -----------------------------------------------------------------------------
-# 2. PROCESAMIENTO Y CONSULTA CON SELENIUM (IESS / CORESALUD)
-# -----------------------------------------------------------------------------
-def procesar_consultas_asegurados(df_pacientes, carpeta_pdf, area_log):
-    driver = None
-    try:
-        area_log.code("Iniciando motor Selenium Headless para portales institucionales...", language="bash")
-        driver = crear_driver(carpeta_pdf)
-        
-        total = len(df_pacientes)
-        for idx, fila in df_pacientes.iterrows():
-            cedula = str(fila.get("Cedula") or fila.get("Cédula") or "").strip()
-            fecha_nac = str(fila.get("Fecha nacimiento") or fila.get("Fecha de nacimiento") or "").strip()
-            dependencia = str(fila.get("Dependencia") or "").strip()
-            
-            area_log.code(f"[{idx+1}/{total}] Consultando Cédula: {cedula} | Servicio: {dependencia}...", language="bash")
-            
-            # Lógica de automatización web conectando a portales IESS / Coresalud
-            # driver.get("URL_PORTAL_INSTITUCIONAL")
-            # ... ingreso de cédula, fecha de nacimiento y descarga de PDF ...
-            time.sleep(1.5)  
-            
-            df_pacientes.at[idx, "Estado"] = "Completado"
+# --- MODO 1: PROCESAMIENTO POR LOTE ---
+if modo == "Lote (Desde Excel)":
+    st.header("📋 Procesamiento por Lote")
+    st.write("Lee los datos directamente desde el archivo `reporte_inconsistencias.xlsx`[cite: 4].")
 
-        area_log.code("Consultas en páginas de asegurados finalizadas con éxito.", language="bash")
-    except Exception as e:
-        area_log.code(f"Error en el proceso de consulta web: {str(e)}", language="bash")
-    finally:
-        if driver:
-            driver.quit()
-            
-    return df_pacientes
+    quiere_matriz = st.checkbox("¿Agregar también los resultados a la matriz de Excel?", value=True)
+    responsable = st.text_input("Nombre del Responsable:").strip().upper()
 
-
-# -----------------------------------------------------------------------------
-# 3. INTERFAZ WEB EN STREAMLIT
-# -----------------------------------------------------------------------------
-st.set_page_config(page_title="Descarga de Coberturas - CORESALUD", layout="wide")
-
-if "cola_pacientes" not in st.session_state:
-    st.session_state.cola_pacientes = []
-
-st.title("📋 Descarga de Coberturas - CORESALUD & IESS")
-
-tab_lotes, tab_manual = st.tabs(["📁 Procesamiento por Lotes", "👤 Ingresar Paciente Manual"])
-
-DEPENDENCIAS = [
-    "GINECOLOGIA (CE)",
-    "MEDICINA FAMILIAR",
-    "MEDICINA GENERAL (CE)",
-    "OBSTETRICIA (CE)",
-    "PEDIATRIA (CE)",
-    "PSICOLOGIA (CE)",
-    "NUTRICION Y DIETETICA"
-]
-
-DIR_DESCARGAS = "PDF_DESCARGADOS"
-ARCHIVO_INSTRUCTIVO = "INSTRUCTIVO5.xlsx"
-
-# ==========================================
-# 1. PESTAÑA: POR LOTES
-# ==========================================
-with tab_lotes:
-    col_btn1, col_btn2 = st.columns([2, 2])
-    
-    archivo_subido = st.file_uploader("Seleccionar matriz de pacientes (.xlsx)", type=["xlsx"])
-    log_lotes = st.empty()
-
-    if archivo_subido:
-        df_lote = pd.read_excel(archivo_subido)
-        st.dataframe(df_lote, use_container_width=True, height=200)
-
-        with col_btn1:
-            if st.button("🚀 Iniciar consultas y descarga (por lotes)", type="primary"):
-                log_lotes.code("Procesando matriz por lotes...", language="bash")
-                df_resultado = procesar_consultas_asegurados(df_lote, DIR_DESCARGAS, log_lotes)
-                
-                # Guardar matriz procesada
-                nombre_salida = "Reporte_Lote_Procesado.xlsx"
-                df_resultado.to_excel(nombre_salida, index=False)
-                
-                # Compilar ZIP incluyendo la matriz, los PDFs y el Instructivo
-                zip_filename = "Resultado_Lote_Completo.zip"
-                with zipfile.ZipFile(zip_filename, 'w') as zipf:
-                    if os.path.exists(nombre_salida):
-                        zipf.write(nombre_salida)
-                    if os.path.exists(ARCHIVO_INSTRUCTIVO):
-                        zipf.write(ARCHIVO_INSTRUCTIVO)
-                    if os.path.exists(DIR_DESCARGAS):
-                        for root, _, files in os.walk(DIR_DESCARGAS):
-                            for f in files:
-                                zipf.write(os.path.join(root, f))
-                
-                with open(zip_filename, "rb") as f:
-                    st.download_button("📦 Descargar Matriz, PDFs e Instructivo (.ZIP)", data=f, file_name=zip_filename, mime="application/zip")
-
-
-# ==========================================
-# 2. PESTAÑA: MANUAL / INTERACTIVO
-# ==========================================
-with tab_manual:
-    st.subheader("Ingresar pacientes manualmente")
-    
-    with st.form(key="form_paciente", clear_on_submit=False):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            responsable = st.text_input("Responsable (persona que ingresa la información):")
-            cedula = st.text_input("Cédula del paciente (*):")
-            fecha_atencion = st.date_input("Fecha de atención (*):", value=datetime.now(), format="DD/MM/YYYY")
-            dependencia = st.selectbox("Dependencia (tipo de consulta):", DEPENDENCIAS)
-            
-        with col2:
-            fecha_nacimiento_str = st.text_input("Fecha de nacimiento (*) [DD-MM-AAAA]:", placeholder="Ej: 15-05-1990")
-            sexo = st.radio("Sexo (*):", ["M", "F"], horizontal=True)
-            observaciones = st.text_input("Observaciones (opcional):")
-
-        btn_agregar = st.form_submit_button("➕ Agregar a la cola y seguir con el siguiente", type="primary")
-
-    if btn_agregar:
-        cedula_valida = cedula.strip() != ""
-        fecha_nac_valida = fecha_nacimiento_str.strip() != ""
-
-        if not cedula_valida or not fecha_nac_valida:
-            st.error("Por favor completa los campos obligatorios: Cédula y Fecha de nacimiento.")
+    if st.button("🚀 Iniciar Descarga por Lotes", disabled=st.session_state.ejecutando):
+        if quiere_matriz and not responsable:
+            st.warning("⚠️ Debes ingresar el nombre del responsable para continuar.")
         else:
-            nuevo_paciente = {
-                "#": len(st.session_state.cola_pacientes) + 1,
-                "Responsable": responsable.strip(),
-                "Cedula": cedula.strip(),
-                "Fecha atencion": fecha_atencion.strftime("%d-%m-%Y"),
-                "Dependencia": dependencia,
-                "Fecha nacimiento": fecha_nacimiento_str.strip(),
-                "Sexo": sexo,
-                "Observaciones": observaciones.strip(),
-                "Estado": "Pendiente"
+            st.session_state.ejecutando = True
+            st.info("Iniciando proceso en segundo plano...")
+
+            def tarea_lote():
+                salida_original = sys.stdout
+                try:
+                    registros = core.leer_excel(core.ARCHIVO_EXCEL)
+                    if core.LIMITE_PRUEBA:
+                        registros = registros[:core.LIMITE_PRUEBA]
+
+                    items = list(enumerate(registros, start=1))
+                    os.makedirs(core.CARPETA_SALIDA, exist_ok=True)
+                    carpeta_temp = os.path.join(core.CARPETA_SALIDA, "_descargas_temp")
+                    os.makedirs(carpeta_temp, exist_ok=True)
+                    carpeta_diag = os.path.join(core.CARPETA_SALIDA, "_diagnostico")
+
+                    driver_holder = [core.crear_driver(carpeta_temp)]
+                    errores, sin_seguro = [], []
+
+                    try:
+                        core.procesar_lote(
+                            items, driver_holder, carpeta_temp, carpeta_diag,
+                            errores, sin_seguro,
+                            escribir_matriz=quiere_matriz, responsable_matriz=responsable
+                        )
+                    finally:
+                        try:
+                            driver_holder[0].quit()
+                        except Exception:
+                            pass
+
+                    core._guardar_reportes_finales(errores, sin_seguro)
+                    st.success("✅ Proceso por lotes finalizado con éxito.")
+                except Exception as e:
+                    st.error(f"❌ Error durante la ejecución: {e}")
+                finally:
+                    st.session_state.ejecutando = False
+
+            threading.Thread(target=tarea_lote, daemon=True).start()
+
+
+# --- MODO 2: INGRESO MANUAL DE PACIENTES ---
+elif modo == "Ingreso Manual":
+    st.header("👤 Ingreso Manual de Paciente")
+
+    with st.form("form_paciente", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            cedula = st.text_input("Cédula del paciente (10 dígitos):")
+            fecha_atencion = st.date_input("Fecha de atención:", date.today())
+            dependencia = st.text_input("Dependencia / Tipo de consulta:")
+        with col2:
+            fecha_nacimiento = st.date_input("Fecha de nacimiento:")
+            sexo = st.selectbox("Sexo:", ["Masculino", "Femenino"])
+            responsable = st.text_input("Responsable que ingresa:").strip().upper()
+
+        observaciones = st.text_input("Observaciones (opcional):")
+        boton_agregar = st.form_submit_button("➕ Agregar a la Cola")
+
+    if boton_agregar:
+        cedula_clean = "".join(filter(str.isdigit, cedula)).zfill(10)
+        if len(cedula_clean) != 10:
+            st.error("Cédula inválida. Debe contener 10 dígitos.")
+        elif not responsable:
+            st.error("Por favor ingresa el nombre del responsable.")
+        else:
+            paciente_datos = {
+                "cedula": cedula_clean,
+                "fecha_atencion": fecha_atencion,
+                "dependencia": dependencia,
+                "fecha_nacimiento": fecha_nacimiento,
+                "sexo_codigo": "M" if sexo == "Masculino" else "F",
+                "responsable": responsable,
+                "observaciones": observaciones,
+                "estado": "En cola"
             }
-            st.session_state.cola_pacientes.append(nuevo_paciente)
-            st.success(f"¡Paciente con Cédula {cedula} agregado a la cola!")
-            st.rerun()
+            st.session_state.pacientes_cola.append(paciente_datos)
+            st.success(f"Paciente con Cédula {cedula_clean} agregado a la cola.")
 
-    st.divider()
-    st.write(f"**{len(st.session_state.cola_pacientes)} en cola**")
+    # Mostrar Tabla de Pacientes en Cola
+    if st.session_state.pacientes_cola:
+        st.subheader("📋 Queue / Pacientes Ingresados")
+        st.dataframe(st.session_state.pacientes_cola)
 
-    df_cola = pd.DataFrame(st.session_state.cola_pacientes)
-    st.dataframe(df_cola, use_container_width=True, height=180)
 
-    log_manual = st.empty()
+# --- MODO 3: GENERAR COPIA EN EXCEL ---
+elif modo == "Generar Copia Excel":
+    st.header("📊 Exportar Copia de Matriz en Excel")
 
-    if len(st.session_state.cola_pacientes) > 0:
-        if st.button("🚀 Ejecutar Consultas y Generar Paquete", type="primary"):
-            df_res = procesar_consultas_asegurados(df_cola, DIR_DESCARGAS, log_manual)
-            
-            # Exportar matriz y empaquetar ZIP incluyendo el instructivo
-            nombre_matriz_manual = "Matriz_Manual_Procesada.xlsx"
-            df_res.to_excel(nombre_matriz_manual, index=False)
-            zip_filename = "Resultado_Manual_Completo.zip"
-            
-            with zipfile.ZipFile(zip_filename, 'w') as zipf:
-                if os.path.exists(nombre_matriz_manual):
-                    zipf.write(nombre_matriz_manual)
-                if os.path.exists(ARCHIVO_INSTRUCTIVO):
-                    zipf.write(ARCHIVO_INSTRUCTIVO)
-                if os.path.exists(DIR_DESCARGAS):
-                    for root, _, files in os.walk(DIR_DESCARGAS):
-                        for f in files:
-                            zipf.write(os.path.join(root, f))
-            
-            with open(zip_filename, "rb") as f:
-                st.download_button("📦 Descargar Matriz, PDFs e Instructivo (.ZIP)", data=f, file_name=zip_filename, mime="application/zip")
+    modo_copia = st.selectbox("¿Qué deseas copiar?", ["todo", "hoy", "mes", "rango"])
+    carpeta_destino = st.text_input("Ruta de carpeta destino:", os.path.expanduser("~"))
+
+    fecha_desde = None
+    fecha_hasta = None
+
+    if modo_copia == "mes":
+        fecha_mes = st.date_input("Selecciona cualquier fecha del mes a exportar:")
+        fecha_desde = fecha_mes
+    elif modo_copia == "rango":
+        col1, col2 = st.columns(2)
+        with col1:
+            fecha_desde = st.date_input("Desde:")
+        with col2:
+            fecha_hasta = st.date_input("Hasta:")
+
+    if st.button("📦 Generar Copia Excel"):
+        try:
+            destino = core.generar_copia_matriz(
+                carpeta_destino=carpeta_destino,
+                modo_fecha=modo_copia,
+                fecha_desde=fecha_desde,
+                fecha_hasta=fecha_hasta
+            )
+            st.success(f"✅ Archivo generado exitosamente en:\n`{destino}`")
+        except Exception as e:
+            st.error(f"❌ Error al generar la copia: {e}")
