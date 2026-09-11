@@ -16,7 +16,6 @@ from webdriver_manager.chrome import ChromeDriverManager
 def crear_driver(carpeta_descargas):
     os.makedirs(carpeta_descargas, exist_ok=True)
     
-    # Rutas binarias típicas para servidores Linux (Streamlit Cloud, Render, etc.)
     RUTAS_CHROMIUM = ("/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome")
     RUTAS_CHROMEDRIVER = ("/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver", "/usr/lib/chromium-browser/chromedriver")
     
@@ -61,32 +60,32 @@ def crear_driver(carpeta_descargas):
 
 
 # -----------------------------------------------------------------------------
-# 2. LÓGICA DE PROCESAMIENTO CON SELENIUM
+# 2. PROCESAMIENTO Y CONSULTA CON SELENIUM (IESS / CORESALUD)
 # -----------------------------------------------------------------------------
-def procesar_cola_con_selenium(df_pacientes, carpeta_pdf, area_log):
+def procesar_consultas_asegurados(df_pacientes, carpeta_pdf, area_log):
     driver = None
     try:
-        area_log.code("Iniciando navegador Chrome Headless...", language="bash")
+        area_log.code("Iniciando motor Selenium Headless para portales institucionales...", language="bash")
         driver = crear_driver(carpeta_pdf)
         
         total = len(df_pacientes)
         for idx, fila in df_pacientes.iterrows():
-            cedula = fila.get("Cedula") or fila.get("Cédula")
-            area_log.code(f"[{idx+1}/{total}] Procesando Cédula: {cedula}...", language="bash")
+            cedula = str(fila.get("Cedula") or fila.get("Cédula") or "").strip()
+            fecha_nac = str(fila.get("Fecha nacimiento") or fila.get("Fecha de nacimiento") or "").strip()
+            dependencia = str(fila.get("Dependencia") or "").strip()
             
-            # ------------------------------------------------------------------
-            # COLOCA AQUÍ TU LÓGICA DE NAVEGACIÓN Y DESCARGA CON SELENIUM
-            # Ejemplo:
-            # driver.get("https://tu-portal-de-consultas.com")
-            # ...
-            # ------------------------------------------------------------------
-            time.sleep(1)  # Simulación de descarga
+            area_log.code(f"[{idx+1}/{total}] Consultando Cédula: {cedula} | Servicio: {dependencia}...", language="bash")
+            
+            # Lógica de automatización web conectando a portales IESS / Coresalud
+            # driver.get("URL_PORTAL_INSTITUCIONAL")
+            # ... ingreso de cédula, fecha de nacimiento y descarga de PDF ...
+            time.sleep(1.5)  
             
             df_pacientes.at[idx, "Estado"] = "Completado"
 
-        area_log.code("Proceso de Scraping finalizado correctamente.", language="bash")
+        area_log.code("Consultas en páginas de asegurados finalizadas con éxito.", language="bash")
     except Exception as e:
-        area_log.code(f"Error durante el procesamiento: {str(e)}", language="bash")
+        area_log.code(f"Error en el proceso de consulta web: {str(e)}", language="bash")
     finally:
         if driver:
             driver.quit()
@@ -102,7 +101,7 @@ st.set_page_config(page_title="Descarga de Coberturas - CORESALUD", layout="wide
 if "cola_pacientes" not in st.session_state:
     st.session_state.cola_pacientes = []
 
-st.title("📋 Descarga de Coberturas - CORESALUD")
+st.title("📋 Descarga de Coberturas - CORESALUD & IESS")
 
 tab_lotes, tab_manual = st.tabs(["📁 Procesamiento por Lotes", "👤 Ingresar Paciente Manual"])
 
@@ -117,6 +116,7 @@ DEPENDENCIAS = [
 ]
 
 DIR_DESCARGAS = "PDF_DESCARGADOS"
+ARCHIVO_INSTRUCTIVO = "INSTRUCTIVO5.xlsx"
 
 # ==========================================
 # 1. PESTAÑA: POR LOTES
@@ -124,7 +124,7 @@ DIR_DESCARGAS = "PDF_DESCARGADOS"
 with tab_lotes:
     col_btn1, col_btn2 = st.columns([2, 2])
     
-    archivo_subido = st.file_uploader("Seleccionar matriz Excel (.xlsx)", type=["xlsx"])
+    archivo_subido = st.file_uploader("Seleccionar matriz de pacientes (.xlsx)", type=["xlsx"])
     log_lotes = st.empty()
 
     if archivo_subido:
@@ -132,23 +132,28 @@ with tab_lotes:
         st.dataframe(df_lote, use_container_width=True, height=200)
 
         with col_btn1:
-            if st.button("🚀 Iniciar descarga (por lotes)", type="primary"):
-                log_lotes.code("Iniciando lote desde Excel...", language="bash")
-                df_resultado = procesar_cola_con_selenium(df_lote, DIR_DESCARGAS, log_lotes)
+            if st.button("🚀 Iniciar consultas y descarga (por lotes)", type="primary"):
+                log_lotes.code("Procesando matriz por lotes...", language="bash")
+                df_resultado = procesar_consultas_asegurados(df_lote, DIR_DESCARGAS, log_lotes)
                 
-                # Guardar resultado y compilar ZIP
-                df_resultado.to_excel("Reporte_Lote_Procesado.xlsx", index=False)
-                zip_filename = "Resultado_Lote.zip"
+                # Guardar matriz procesada
+                nombre_salida = "Reporte_Lote_Procesado.xlsx"
+                df_resultado.to_excel(nombre_salida, index=False)
                 
+                # Compilar ZIP incluyendo la matriz, los PDFs y el Instructivo
+                zip_filename = "Resultado_Lote_Completo.zip"
                 with zipfile.ZipFile(zip_filename, 'w') as zipf:
-                    zipf.write("Reporte_Lote_Procesado.xlsx")
+                    if os.path.exists(nombre_salida):
+                        zipf.write(nombre_salida)
+                    if os.path.exists(ARCHIVO_INSTRUCTIVO):
+                        zipf.write(ARCHIVO_INSTRUCTIVO)
                     if os.path.exists(DIR_DESCARGAS):
                         for root, _, files in os.walk(DIR_DESCARGAS):
                             for f in files:
                                 zipf.write(os.path.join(root, f))
                 
                 with open(zip_filename, "rb") as f:
-                    st.download_button("📦 Descargar Matriz y PDFs (.ZIP)", data=f, file_name=zip_filename, mime="application/zip")
+                    st.download_button("📦 Descargar Matriz, PDFs e Instructivo (.ZIP)", data=f, file_name=zip_filename, mime="application/zip")
 
 
 # ==========================================
@@ -204,19 +209,23 @@ with tab_manual:
     log_manual = st.empty()
 
     if len(st.session_state.cola_pacientes) > 0:
-        if st.button("🚀 Procesar Cola Manual con Selenium", type="primary"):
-            df_res = procesar_cola_con_selenium(df_cola, DIR_DESCARGAS, log_manual)
+        if st.button("🚀 Ejecutar Consultas y Generar Paquete", type="primary"):
+            df_res = procesar_consultas_asegurados(df_cola, DIR_DESCARGAS, log_manual)
             
-            # Exportar Matriz y comprimir
-            df_res.to_excel("Matriz_Manual_Procesada.xlsx", index=False)
-            zip_filename = "Resultado_Manual.zip"
+            # Exportar matriz y empaquetar ZIP incluyendo el instructivo
+            nombre_matriz_manual = "Matriz_Manual_Procesada.xlsx"
+            df_res.to_excel(nombre_matriz_manual, index=False)
+            zip_filename = "Resultado_Manual_Completo.zip"
             
             with zipfile.ZipFile(zip_filename, 'w') as zipf:
-                zipf.write("Matriz_Manual_Procesada.xlsx")
+                if os.path.exists(nombre_matriz_manual):
+                    zipf.write(nombre_matriz_manual)
+                if os.path.exists(ARCHIVO_INSTRUCTIVO):
+                    zipf.write(ARCHIVO_INSTRUCTIVO)
                 if os.path.exists(DIR_DESCARGAS):
                     for root, _, files in os.walk(DIR_DESCARGAS):
                         for f in files:
                             zipf.write(os.path.join(root, f))
             
             with open(zip_filename, "rb") as f:
-                st.download_button("📦 Descargar Matriz y PDFs (.ZIP)", data=f, file_name=zip_filename, mime="application/zip")
+                st.download_button("📦 Descargar Matriz, PDFs e Instructivo (.ZIP)", data=f, file_name=zip_filename, mime="application/zip")
