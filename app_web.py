@@ -153,12 +153,13 @@ with tab_lotes:
 
 
 # ==========================================
-# 2. PESTAÑA: MANUAL / INTERACTIVO
+# 2. PESTAÑA: MANUAL / INTERACTIVO (CORREGIDO)
 # ==========================================
 with tab_manual:
     st.subheader("Ingresar pacientes manualmente")
     
-    with st.form(key="form_paciente", clear_on_submit=True):
+    # IMPORTANTE: Desactivamos el limpiado automático 'clear_on_submit=False'
+    with st.form(key="form_paciente", clear_on_submit=False):
         col1, col2 = st.columns(2)
         with col1:
             responsable = st.text_input("Responsable (persona que ingresa la información):")
@@ -171,10 +172,12 @@ with tab_manual:
             sexo = st.radio("Sexo (*):", ["M", "F"], horizontal=True)
             observaciones = st.text_input("Observaciones (opcional):")
 
+        # Botón para enviar el formulario
         btn_agregar = st.form_submit_button("➕ Agregar a la cola y seguir con el siguiente", type="primary")
 
+    # Validación y guardado en la cola de la sesión
     if btn_agregar:
-        if not cedula or fecha_nacimiento is None:
+        if not cedula.strip() or fecha_nacimiento is None:
             st.error("Por favor completa los campos obligatorios: Cédula y Fecha de nacimiento.")
         else:
             nuevo_paciente = {
@@ -189,8 +192,8 @@ with tab_manual:
                 "Estado": "Pendiente"
             }
             st.session_state.cola_pacientes.append(nuevo_paciente)
-            st.success(f"Paciente con Cédula {cedula} agregado.")
-
+            st.success(f"¡Paciente con Cédula {cedula} agregado correctamente a la cola!")
+            st.rerun()  # Actualiza la interfaz inmediatamente
     st.divider()
     st.write(f"**{len(st.session_state.cola_pacientes)} en cola**")
 
