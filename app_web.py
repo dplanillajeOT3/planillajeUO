@@ -23,7 +23,10 @@ de una PC de escritorio Windows).
 import os
 import io
 import sys
+import time
+import uuid
 import queue
+import zipfile
 import threading
 import contextlib
 import traceback
@@ -52,6 +55,237 @@ except ImportError as e:
 st.set_page_config(page_title="Coberturas de Salud - MSP", page_icon="⚕️", layout="wide")
 
 # ============================================================
+# LOGIN POR UNIDAD (aisla los archivos de cada unidad operativa)
+# ============================================================
+#
+# Los usuarios/contraseñas NUNCA van en este archivo ni en GitHub: se
+# definen en los "Secrets" de la app en Streamlit Cloud (Settings >
+# Secrets), con este formato:
+#
+#   [usuarios]
+#   pumamaqui = { password = "clave-segura-1", nombre = "Casa de Acogida Pumamaqui" }
+#   san_juan  = { password = "clave-segura-2", nombre = "UO San Juan" }
+#   ...  (una linea por cada una de las 21 unidades)
+#
+# El texto antes de "=" (ej. "pumamaqui") es lo que la unidad escribe
+# como usuario. Cada unidad, al iniciar sesion, solo ve y modifica sus
+# PROPIOS archivos (matriz, PDFs, datos de pacientes guardados) -nunca
+# los de otra unidad-, porque a partir de aqui se redirige todo el
+# motor a una subcarpeta propia de esa unidad.
+
+def _cargar_usuarios():
+    try:
+        return {k: dict(v) for k, v in st.secrets["usuarios"].items()}
+    except Exception:
+        return {}
+
+
+if "auth_unidad" not in st.session_state:
+    st.session_state.auth_unidad = None
+
+if st.session_state.auth_unidad is None:
+    st.title("⚕️ Coberturas de Salud — Acceso")
+    usuarios = _cargar_usuarios()
+
+    if not usuarios:
+        st.error(
+            "Todavía no hay usuarios configurados. En Streamlit Cloud, entra a "
+            "**Settings → Secrets** de esta app y agrega la sección `[usuarios]` "
+            "(ver el comentario al inicio de `app_web.py` para el formato exacto)."
+        )
+        st.stop()
+
+    with st.form("form_login"):
+        usuario_in = st.text_input("Usuario (unidad operativa)")
+        clave_in = st.text_input("Contraseña", type="password")
+        entrar = st.form_submit_button("Entrar", type="primary")
+
+    if entrar:
+        datos_usuario = usuarios.get(usuario_in.strip())
+        if datos_usuario and clave_in == datos_usuario.get("password"):
+            st.session_state.auth_unidad = usuario_in.strip()
+            st.session_state.auth_unidad_nombre = datos_usuario.get("nombre", usuario_in.strip())
+            st.rerun()
+        else:
+            st.error("Usuario o contraseña incorrectos.")
+
+    st.stop()
+
+# ------------------------------------------------------------------
+# A partir de aqui, ya hay una unidad autenticada. Se redirige TODO el
+# motor (matriz, PDFs, datos_pacientes.json, respaldos) a una carpeta
+# exclusiva de esta unidad, para que nunca se mezcle con las de las
+# otras 20. Cada unidad debe subir su propio INSTRUCTIVO...xlsx una
+# sola vez (mas abajo se le pide si todavia no lo tiene).
+# ------------------------------------------------------------------
+_UNIDAD = st.session_state.auth_unidad
+_CARPETA_BASE_ORIGINAL = motor.BASE_DIR
+_carpeta_unidad = os.path.join(_CARPETA_BASE_ORIGINAL, "DATOS_UNIDADES", _UNIDAD)
+os.makedirs(_carpeta_unidad, exist_ok=True)
+
+motor.BASE_DIR = _carpeta_unidad
+motor.ARCHIVO_EXCEL = os.path.join(_carpeta_unidad, "reporte_inconsistencias.xlsx")
+motor.CARPETA_SALIDA = os.path.join(_carpeta_unidad, "PDF_DESCARGADOS")
+motor.RUTA_DATOS_PACIENTES = os.path.join(_carpeta_unidad, "datos_pacientes.json")
+motor.CARPETA_RESPALDOS_MATRIZ = os.path.join(_carpeta_unidad, "_respaldos_matriz")
+
+# ============================================================
+# SINCRONIZACION CON GOOGLE DRIVE (persistencia entre redeploys)
+# ============================================================
+#
+# Requiere que en los Secrets de Streamlit Cloud exista la seccion
+# [gcp_service_account] con el contenido del .json de la cuenta de
+# servicio (ver README.md). Si no esta configurada, la app sigue
+# funcionando igual mas no persiste entre redeploys.
+
+_DRIVE_CARPETA_RAIZ_ID_DEFECTO = "1OQ9dkzDOtbQT90mljvoPvzToJcPOSeH6"
+
+
+def _drive_disponible():
+    try:
+        return "gcp_service_account" in st.secrets
+    except Exception:
+        return False
+
+
+@st.cache_resource
+def _drive_cliente():
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    info = dict(st.secrets["gcp_service_account"])
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _drive_carpeta_raiz_id():
+    try:
+        return st.secrets["drive"]["carpeta_raiz_id"]
+    except Exception:
+        return _DRIVE_CARPETA_RAIZ_ID_DEFECTO
+
+
+def _drive_obtener_o_crear_carpeta(nombre, carpeta_padre_id):
+    servicio = _drive_cliente()
+    nombre_escapado = nombre.replace("'", "\\'")
+    query = (
+        f"'{carpeta_padre_id}' in parents and name = '{nombre_escapado}' "
+        "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    )
+    resultado = servicio.files().list(q=query, fields="files(id, name)", pageSize=1).execute()
+    archivos = resultado.get("files", [])
+    if archivos:
+        return archivos[0]["id"]
+    metadata = {"name": nombre, "mimeType": "application/vnd.google-apps.folder", "parents": [carpeta_padre_id]}
+    carpeta = servicio.files().create(body=metadata, fields="id").execute()
+    return carpeta["id"]
+
+
+def _drive_listar(carpeta_id):
+    servicio = _drive_cliente()
+    archivos, token = [], None
+    while True:
+        resultado = servicio.files().list(
+            q=f"'{carpeta_id}' in parents and trashed = false",
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageToken=token, pageSize=200
+        ).execute()
+        archivos.extend(resultado.get("files", []))
+        token = resultado.get("nextPageToken")
+        if not token:
+            break
+    return archivos
+
+
+def _drive_subir_o_actualizar(ruta_local, nombre_remoto, carpeta_id):
+    from googleapiclient.http import MediaFileUpload
+    servicio = _drive_cliente()
+    existentes = [
+        f for f in _drive_listar(carpeta_id)
+        if f["name"] == nombre_remoto and f["mimeType"] != "application/vnd.google-apps.folder"
+    ]
+    media = MediaFileUpload(ruta_local, resumable=False)
+    if existentes:
+        servicio.files().update(fileId=existentes[0]["id"], media_body=media).execute()
+    else:
+        servicio.files().create(body={"name": nombre_remoto, "parents": [carpeta_id]}, media_body=media).execute()
+
+
+def _drive_descargar_archivo(archivo_id, ruta_destino):
+    from googleapiclient.http import MediaIoBaseDownload
+    servicio = _drive_cliente()
+    solicitud = servicio.files().get_media(fileId=archivo_id)
+    os.makedirs(os.path.dirname(ruta_destino), exist_ok=True)
+    with open(ruta_destino, "wb") as f:
+        descargador = MediaIoBaseDownload(f, solicitud)
+        listo = False
+        while not listo:
+            _, listo = descargador.next_chunk()
+
+
+def _drive_subir_carpeta(carpeta_local, carpeta_id):
+    """Sube/actualiza TODO el contenido de carpeta_local dentro de
+    carpeta_id en Drive, recursivamente (espejo local -> nube)."""
+    if not carpeta_id or not os.path.isdir(carpeta_local):
+        return
+    for nombre in os.listdir(carpeta_local):
+        if nombre.startswith("."):
+            continue
+        ruta = os.path.join(carpeta_local, nombre)
+        if os.path.isdir(ruta):
+            sub_id = _drive_obtener_o_crear_carpeta(nombre, carpeta_id)
+            _drive_subir_carpeta(ruta, sub_id)
+        else:
+            _drive_subir_o_actualizar(ruta, nombre, carpeta_id)
+
+
+def _drive_descargar_carpeta(carpeta_id, carpeta_local):
+    """Descarga TODO el contenido de carpeta_id de Drive a carpeta_local,
+    recursivamente (nube -> local; se usa para restaurar al iniciar sesion)."""
+    if not carpeta_id:
+        return
+    os.makedirs(carpeta_local, exist_ok=True)
+    for item in _drive_listar(carpeta_id):
+        ruta_local = os.path.join(carpeta_local, item["name"])
+        if item["mimeType"] == "application/vnd.google-apps.folder":
+            _drive_descargar_carpeta(item["id"], ruta_local)
+        else:
+            _drive_descargar_archivo(item["id"], ruta_local)
+
+
+def _drive_sincronizar_ahora(mensaje_spinner="Guardando en la nube..."):
+    if not st.session_state.get("drive_carpeta_unidad_id"):
+        return
+    with st.spinner(mensaje_spinner):
+        try:
+            _drive_subir_carpeta(_carpeta_unidad, st.session_state.drive_carpeta_unidad_id)
+        except Exception as e:
+            st.warning(f"No se pudo guardar en la nube: {e}")
+
+
+# Al entrar, restaura de Drive lo que ya existiera de esta unidad
+# (asi el disco temporal de Streamlit Cloud "recupera" lo que se
+# habia perdido en el ultimo redeploy).
+if "drive_carpeta_unidad_id" not in st.session_state:
+    if _drive_disponible():
+        try:
+            with st.spinner("Conectando con Google Drive y restaurando los datos de tu unidad..."):
+                _raiz_id = _drive_carpeta_raiz_id()
+                _id_unidad = _drive_obtener_o_crear_carpeta(_UNIDAD, _raiz_id)
+                st.session_state.drive_carpeta_unidad_id = _id_unidad
+                _drive_descargar_carpeta(_id_unidad, _carpeta_unidad)
+        except Exception as e:
+            st.session_state.drive_carpeta_unidad_id = None
+            st.warning(
+                f"No se pudo conectar con Google Drive todavía ({e}). "
+                "Se sigue trabajando con el disco temporal; usa el botón "
+                "'📦 Descargar todos los PDF (.zip)' como respaldo mientras tanto."
+            )
+    else:
+        st.session_state.drive_carpeta_unidad_id = None
+
+# ============================================================
 # UTILIDADES COMUNES
 # ============================================================
 
@@ -72,6 +306,30 @@ def _tabla_desde_filas(filas, columnas):
     return [dict(zip(columnas, fila)) for fila in filas]
 
 
+def _boton_descargar_zip(etiqueta, key):
+    """Comprime toda la carpeta PDF_DESCARGADOS (PDFs + reportes) en un
+    .zip y ofrece descargarlo al navegador del usuario. Sirve sin
+    importar en que maquina este corriendo la app (local o en la nube),
+    porque la descarga viaja por el propio navegador, no depende de
+    que el usuario tenga acceso al disco del servidor."""
+    if not os.path.isdir(motor.CARPETA_SALIDA):
+        st.caption("Todavía no hay nada descargado en esta sesión.")
+        return
+    if st.button(etiqueta, key=key):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for raiz, _dirs, archivos in os.walk(motor.CARPETA_SALIDA):
+                for nombre_archivo in archivos:
+                    ruta_completa = os.path.join(raiz, nombre_archivo)
+                    ruta_relativa = os.path.relpath(ruta_completa, motor.CARPETA_SALIDA)
+                    zf.write(ruta_completa, ruta_relativa)
+        buffer.seek(0)
+        st.download_button(
+            "⬇️ Descargar PDF_DESCARGADOS.zip", buffer.getvalue(),
+            file_name="PDF_DESCARGADOS.zip", mime="application/zip", key=key + "_dl"
+        )
+
+
 def _reset_estado_auto():
     st.session_state.auto_running = False
     st.session_state.auto_queue = None
@@ -82,35 +340,208 @@ def _reset_estado_auto():
     st.session_state.auto_sin_seguro = []
     st.session_state.auto_done = False
     st.session_state.auto_error_fatal = None
+    st.session_state.auto_indices_error = set()
+    st.session_state.auto_escribir_matriz = False
+    st.session_state.auto_responsable_matriz = ""
 
 
 def _init_estado():
     if "auto_running" not in st.session_state:
         _reset_estado_auto()
-    if "manual_driver_holder" not in st.session_state:
-        st.session_state.manual_driver_holder = None
     if "manual_errores" not in st.session_state:
         st.session_state.manual_errores = []
     if "manual_sin_seguro" not in st.session_state:
         st.session_state.manual_sin_seguro = []
     if "manual_contador" not in st.session_state:
         st.session_state.manual_contador = 0
-    if "manual_ultimo_resultado" not in st.session_state:
-        st.session_state.manual_ultimo_resultado = None
     if "manual_datos_previos" not in st.session_state:
         st.session_state.manual_datos_previos = None
     if "manual_cedula_buscada" not in st.session_state:
         st.session_state.manual_cedula_buscada = None
+    if "manual_queue_in" not in st.session_state:
+        st.session_state.manual_queue_in = queue.Queue()
+    if "manual_queue_out" not in st.session_state:
+        st.session_state.manual_queue_out = queue.Queue()
+    if "manual_worker_thread" not in st.session_state:
+        st.session_state.manual_worker_thread = None
+    if "manual_items" not in st.session_state:
+        st.session_state.manual_items = []  # cola visible: [{id, cedula, fecha, estado, ...}]
+
+
+def _worker_manual(q_in, q_out, carpeta_descargas_temp, carpeta_diagnostico):
+    """Corre en un hilo aparte, uno por sesion de usuario. Mantiene UN
+    solo Chrome abierto (igual que modo_interactivo en consola) y va
+    tomando pacientes de la cola en el orden en que llegan, sin que la
+    interfaz tenga que esperar a que termine cada uno."""
+    driver_holder = [None]
+    while True:
+        item = q_in.get()
+        if item is None:  # senal para terminar el hilo
+            if driver_holder[0] is not None:
+                try:
+                    driver_holder[0].quit()
+                except Exception:
+                    pass
+            return
+        if item.get("accion") == "cerrar_driver":
+            if driver_holder[0] is not None:
+                try:
+                    driver_holder[0].quit()
+                except Exception:
+                    pass
+                driver_holder[0] = None
+            continue
+
+        item_id = item["id"]
+        q_out.put(("procesando", item_id, None))
+        log_buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(log_buffer):
+                if driver_holder[0] is None:
+                    driver_holder[0] = motor.crear_driver(carpeta_descargas_temp)
+
+                reg = {
+                    "cedula": item["cedula"],
+                    "nombre": None,
+                    "fechas": [item["fecha_atencion"]],
+                    "cedula_padre": None,
+                    "cedula_titular": None,
+                }
+                errores_local, sin_seguro_local = [], []
+                filas_matriz = motor.procesar_registro(
+                    reg, item["contador"], item["contador"], driver_holder,
+                    carpeta_descargas_temp, carpeta_diagnostico,
+                    errores_local, sin_seguro_local, recolectar_matriz=True
+                )
+                motor.guardar_datos_paciente(
+                    item["cedula"], nombre=reg.get("nombre"),
+                    fecha_nacimiento=item["fecha_nacimiento"], sexo=item["sexo"]
+                )
+                filas_escritas = []
+                if item.get("hay_matriz") and filas_matriz:
+                    try:
+                        filas_escritas = motor.agregar_filas_matriz_con_bloqueo(
+                            filas_matriz, item["dependencia"], item["fecha_nacimiento"],
+                            item["sexo"], item["observaciones"], item["responsable"]
+                        )
+                    except TimeoutError as e:
+                        errores_local.append([
+                            reg.get("nombre") or item["cedula"], item["cedula"],
+                            item["fecha_atencion"].strftime("%d-%m-%Y"), f"(MATRIZ) {e}"
+                        ])
+
+            q_out.put(("listo", item_id, {
+                "nombre": reg.get("nombre"),
+                "log": log_buffer.getvalue(),
+                "filas_matriz": filas_escritas,
+                "errores": errores_local,
+                "sin_seguro": sin_seguro_local,
+            }))
+        except Exception as e:
+            try:
+                driver_holder[0].quit()
+            except Exception:
+                pass
+            driver_holder[0] = None
+            q_out.put(("error", item_id, {
+                "detalle": f"{type(e).__name__}: {e}",
+                "log": log_buffer.getvalue(),
+            }))
+
+
+def _lanzar_auto(items, escribir_matriz, responsable_matriz, es_reintento=False):
+    """Arranca el hilo de descarga para 'items' (lista de (indice_original,
+    registro)). Si es_reintento=True, sigue acumulando en las mismas
+    listas de errores/sin_seguro que ya se tenian (no se pierde el
+    historial de la corrida anterior); si es False, arranca de cero."""
+    if es_reintento:
+        errores_base = list(st.session_state.auto_errores)
+        sin_seguro_base = list(st.session_state.auto_sin_seguro)
+        st.session_state.auto_log.append(f"--- Reintentando {len(items)} registro(s) fallido(s) ---")
+    else:
+        errores_base, sin_seguro_base = [], []
+        st.session_state.auto_log = []
+
+    st.session_state.auto_running = True
+    st.session_state.auto_done = False
+    st.session_state.auto_error_fatal = None
+    st.session_state.auto_progress = (0, len(items))
+    st.session_state.auto_indices_error = set()
+    st.session_state.auto_escribir_matriz = escribir_matriz
+    st.session_state.auto_responsable_matriz = responsable_matriz
+
+    q = queue.Queue()
+    st.session_state.auto_queue = q
+
+    def _worker(q, items, escribir_matriz, responsable_matriz, errores, sin_seguro):
+        class _QueueWriter:
+            def write(self, s):
+                s = s.rstrip("\n")
+                if s.strip():
+                    q.put(("log", s))
+
+            def flush(self):
+                pass
+
+        driver_holder = None
+        try:
+            with contextlib.redirect_stdout(_QueueWriter()):
+                carpeta_descargas_temp, carpeta_diagnostico = _asegurar_carpetas()
+                driver_holder = [motor.crear_driver(carpeta_descargas_temp)]
+
+                def cb_fila(i, estado):
+                    q.put(("fila", i, len(items), estado))
+
+                def cb_progreso(n, total):
+                    q.put(("progress", n, total))
+
+                motor.procesar_lote(
+                    items, driver_holder, carpeta_descargas_temp, carpeta_diagnostico,
+                    errores, sin_seguro, callback_fila=cb_fila, callback_progreso=cb_progreso,
+                    escribir_matriz=escribir_matriz, responsable_matriz=responsable_matriz
+                )
+                motor._guardar_reportes_finales(errores, sin_seguro)
+
+            q.put(("done", errores, sin_seguro))
+        except Exception as e:
+            q.put(("error", f"{type(e).__name__}: {e}\n{traceback.format_exc()}"))
+        finally:
+            if driver_holder is not None:
+                try:
+                    driver_holder[0].quit()
+                except Exception:
+                    pass
+
+    t = threading.Thread(
+        target=_worker, args=(q, items, escribir_matriz, responsable_matriz, errores_base, sin_seguro_base),
+        daemon=True
+    )
+    st.session_state.auto_thread = t
+    t.start()
 
 
 _init_estado()
 
-st.title("⚕️ Descarga de Coberturas de Salud")
-st.caption(
-    "Interfaz web del mismo motor de `descargar_coberturas.py`: consulta "
-    "coberturasalud.msp.gob.ec (y app.iess.gob.ec cuando aplica) y organiza "
-    "los PDF igual que la version de escritorio."
-)
+col_titulo, col_sesion = st.columns([4, 1])
+with col_titulo:
+    st.title("⚕️ Descarga de Coberturas de Salud")
+    st.caption(
+        f"Unidad: **{st.session_state.get('auth_unidad_nombre', _UNIDAD)}** — "
+        "interfaz web del mismo motor de `descargar_coberturas.py`."
+    )
+with col_sesion:
+    st.write("")
+    if st.button("🚪 Cerrar sesión"):
+        _drive_sincronizar_ahora("Guardando todo en la nube antes de salir...")
+        st.session_state.auth_unidad = None
+        st.session_state.auth_unidad_nombre = None
+        st.session_state.drive_carpeta_unidad_id = None
+        st.rerun()
+
+if st.session_state.get("drive_carpeta_unidad_id"):
+    st.caption("☁️ Conectado a Google Drive — tus archivos se pueden respaldar en la nube.")
+else:
+    st.caption("⚠️ Sin conexión a Google Drive — los archivos solo viven en este servidor temporal.")
 
 tab_auto, tab_manual = st.tabs(["📂 Modo automático (Excel)", "🧍 Modo manual (un paciente a la vez)"])
 
@@ -164,64 +595,17 @@ with tab_auto:
         with open(motor.ARCHIVO_EXCEL, "wb") as f:
             f.write(archivo_subido.getvalue())
 
-        _reset_estado_auto()
-        st.session_state.auto_running = True
-        q = queue.Queue()
-        st.session_state.auto_queue = q
-
-        def _worker(q, escribir_matriz, responsable_matriz):
-            class _QueueWriter:
-                def write(self, s):
-                    s = s.rstrip("\n")
-                    if s.strip():
-                        q.put(("log", s))
-
-                def flush(self):
-                    pass
-
-            driver_holder = None
-            try:
-                with contextlib.redirect_stdout(_QueueWriter()):
-                    registros = motor.leer_excel(motor.ARCHIVO_EXCEL)
-                    if motor.LIMITE_PRUEBA:
-                        registros = registros[: motor.LIMITE_PRUEBA]
-
-                    carpeta_descargas_temp, carpeta_diagnostico = _asegurar_carpetas()
-                    driver_holder = [motor.crear_driver(carpeta_descargas_temp)]
-
-                    errores, sin_seguro = [], []
-                    items = list(enumerate(registros, start=1))
-
-                    def cb_fila(i, estado):
-                        q.put(("fila", i, len(items), estado))
-
-                    def cb_progreso(n, total):
-                        q.put(("progress", n, total))
-
-                    motor.procesar_lote(
-                        items, driver_holder, carpeta_descargas_temp, carpeta_diagnostico,
-                        errores, sin_seguro, callback_fila=cb_fila, callback_progreso=cb_progreso,
-                        escribir_matriz=escribir_matriz, responsable_matriz=responsable_matriz
-                    )
-
-                    motor._guardar_reportes_finales(errores, sin_seguro)
-
-                q.put(("done", errores, sin_seguro))
-            except Exception as e:
-                q.put(("error", f"{type(e).__name__}: {e}\n{traceback.format_exc()}"))
-            finally:
-                if driver_holder is not None:
-                    try:
-                        driver_holder[0].quit()
-                    except Exception:
-                        pass
-
-        t = threading.Thread(
-            target=_worker, args=(q, escribir_matriz, responsable_matriz), daemon=True
-        )
-        st.session_state.auto_thread = t
-        t.start()
-        st.rerun()
+        try:
+            registros = motor.leer_excel(motor.ARCHIVO_EXCEL)
+            if motor.LIMITE_PRUEBA:
+                registros = registros[: motor.LIMITE_PRUEBA]
+        except Exception as e:
+            st.error(f"No se pudo leer el Excel: {e}")
+        else:
+            _reset_estado_auto()
+            items = list(enumerate(registros, start=1))
+            _lanzar_auto(items, escribir_matriz, responsable_matriz, es_reintento=False)
+            st.rerun()
 
     # --- Drena la cola y refresca mientras corre ---
     if st.session_state.auto_running and st.session_state.auto_queue is not None:
@@ -235,12 +619,15 @@ with tab_auto:
                 elif tipo == "progress":
                     st.session_state.auto_progress = (item[1], item[2])
                 elif tipo == "fila":
-                    pass  # el detalle ya queda en el log
+                    _, i, _total_items, estado = item
+                    if estado == "Con errores":
+                        st.session_state.auto_indices_error.add(i)
                 elif tipo == "done":
                     st.session_state.auto_errores = item[1]
                     st.session_state.auto_sin_seguro = item[2]
                     st.session_state.auto_done = True
                     st.session_state.auto_running = False
+                    _drive_sincronizar_ahora("Tanda terminada, guardando en la nube...")
                 elif tipo == "error":
                     st.session_state.auto_error_fatal = item[1]
                     st.session_state.auto_running = False
@@ -257,8 +644,7 @@ with tab_auto:
 
     if st.session_state.auto_running:
         st.info("Descargando... esta pestaña se actualiza sola.")
-        import time as _time
-        _time.sleep(1.2)
+        time.sleep(1.2)
         st.rerun()
 
     if st.session_state.auto_error_fatal:
@@ -296,6 +682,37 @@ with tab_auto:
                         st.download_button("⬇️ Descargar sin_seguro.xlsx", f.read(),
                                             file_name="sin_seguro.xlsx", key="dl_sinseguro")
 
+        col_zip, col_nube = st.columns(2)
+        with col_zip:
+            _boton_descargar_zip("📦 Descargar todos los PDF (.zip)", key="zip_auto")
+        with col_nube:
+            if st.session_state.get("drive_carpeta_unidad_id") and st.button("☁️ Guardar en la nube ahora", key="sync_auto"):
+                _drive_sincronizar_ahora()
+                st.success("Guardado en Google Drive.")
+
+        if st.session_state.auto_indices_error:
+            st.markdown("---")
+            n_fallidos = len(st.session_state.auto_indices_error)
+            st.write(f"⚠️ {n_fallidos} registro(s) del Excel original terminaron con error.")
+            if st.button(f"🔁 Reintentar los {n_fallidos} fallido(s)", type="primary"):
+                try:
+                    registros_todos = motor.leer_excel(motor.ARCHIVO_EXCEL)
+                except Exception as e:
+                    st.error(f"No se pudo releer el Excel original para reintentar: {e}")
+                else:
+                    indices = sorted(st.session_state.auto_indices_error)
+                    items_retry = [
+                        (i, registros_todos[i - 1]) for i in indices if 0 < i <= len(registros_todos)
+                    ]
+                    if items_retry:
+                        _lanzar_auto(
+                            items_retry, st.session_state.auto_escribir_matriz,
+                            st.session_state.auto_responsable_matriz, es_reintento=True
+                        )
+                        st.rerun()
+                    else:
+                        st.warning("No se encontraron esas filas en el Excel actual (¿se reemplazó el archivo?).")
+
         if st.button("Empezar otra carga"):
             _reset_estado_auto()
             st.rerun()
@@ -322,11 +739,36 @@ with tab_manual:
 
     if aviso_matriz:
         st.warning(
-            f"{aviso_matriz}\n\nSe podrán descargar los PDF de cobertura con normalidad, "
-            "pero no se llenará la matriz automáticamente."
+            "Esta unidad todavía no tiene su archivo INSTRUCTIVO (matriz mensual) configurado. "
+            "Se podrán descargar los PDF de cobertura con normalidad, pero no se llenará la "
+            "matriz automáticamente hasta que subas uno."
         )
+        instructivo_subido = st.file_uploader(
+            "Sube el INSTRUCTIVO...xlsx de esta unidad (solo hace falta una vez)",
+            type=["xlsx"], key="uploader_instructivo"
+        )
+        if instructivo_subido is not None:
+            os.makedirs(motor.BASE_DIR, exist_ok=True)
+            ruta_guardado = os.path.join(motor.BASE_DIR, instructivo_subido.name)
+            with open(ruta_guardado, "wb") as f:
+                f.write(instructivo_subido.getvalue())
+            st.success(f"Guardado como {instructivo_subido.name}. Recargando...")
+            st.rerun()
 
     responsable = st.text_input("Nombre del responsable (persona que ingresa la información)", key="manual_responsable").upper()
+
+    # Arranca el hilo de trabajo de esta sesion (una sola vez).
+    carpeta_descargas_temp, carpeta_diagnostico = _asegurar_carpetas()
+    hilo = st.session_state.manual_worker_thread
+    if hilo is None or not hilo.is_alive():
+        hilo = threading.Thread(
+            target=_worker_manual,
+            args=(st.session_state.manual_queue_in, st.session_state.manual_queue_out,
+                  carpeta_descargas_temp, carpeta_diagnostico),
+            daemon=True
+        )
+        st.session_state.manual_worker_thread = hilo
+        hilo.start()
 
     st.markdown("---")
     st.markdown(f"**Paciente #{st.session_state.manual_contador + 1}**")
@@ -355,6 +797,7 @@ with tab_manual:
         fecha_nac_defecto = motor._parsear_fecha_flexible(datos_guardados["fecha_nacimiento"])
     sexo_defecto = (datos_guardados or {}).get("sexo", "F")
 
+    PLACEHOLDER_DEP = "-- Selecciona --"
     with st.form("form_manual", clear_on_submit=False):
         c1, c2 = st.columns(2)
         with c1:
@@ -365,18 +808,22 @@ with tab_manual:
                 min_value=date(1900, 1, 1), max_value=date.today(),
                 key="manual_fecha_nac"
             )
-            sexo = st.radio("Sexo del paciente", ["F", "M"], index=(0 if sexo_defecto != "M" else 1), horizontal=True)
+            sexo = st.radio("Sexo del paciente", ["F", "M"], index=(0 if sexo_defecto != "M" else 1),
+                             horizontal=True, key="manual_sexo")
         with c2:
             if dependencias_validas:
-                dependencia = st.selectbox("Dependencia (tipo de consulta)",
-                                            options=dependencias_validas + ["OTRA (escribir)"])
+                dependencia = st.selectbox(
+                    "Dependencia (tipo de consulta)",
+                    options=[PLACEHOLDER_DEP] + dependencias_validas + ["OTRA (escribir)"],
+                    key="manual_dependencia"
+                )
                 if dependencia == "OTRA (escribir)":
-                    dependencia = st.text_input("Escribe la dependencia").upper()
+                    dependencia = st.text_input("Escribe la dependencia", key="manual_dependencia_otra").upper()
             else:
-                dependencia = st.text_input("Dependencia (tipo de consulta)").upper()
-            observaciones = st.text_area("Observaciones (opcional)", height=90)
+                dependencia = st.text_input("Dependencia (tipo de consulta)", key="manual_dependencia_otra").upper()
+            observaciones = st.text_area("Observaciones (opcional)", height=90, key="manual_observaciones")
 
-        enviado = st.form_submit_button("🔍 Consultar y descargar cobertura", type="primary")
+        enviado = st.form_submit_button("➕ Agregar a la cola y continuar con el siguiente", type="primary")
 
     if enviado:
         cedula_normalizada = "".join(ch for ch in (cedula_input or "") if ch.isdigit()).zfill(10)[:10]
@@ -384,87 +831,106 @@ with tab_manual:
             st.error("Ingresa una cédula válida de 10 dígitos.")
         elif not responsable:
             st.error("Ingresa el nombre del responsable.")
+        elif dependencias_validas and dependencia == PLACEHOLDER_DEP:
+            st.error("Selecciona una dependencia.")
+        elif not dependencia:
+            st.error("Ingresa la dependencia.")
         else:
-            carpeta_descargas_temp, carpeta_diagnostico = _asegurar_carpetas()
-            if st.session_state.manual_driver_holder is None:
-                with st.spinner("Abriendo navegador..."):
-                    st.session_state.manual_driver_holder = [motor.crear_driver(carpeta_descargas_temp)]
-            driver_holder = st.session_state.manual_driver_holder
-
             st.session_state.manual_contador += 1
-            contador = st.session_state.manual_contador
-
-            reg = {
+            item_id = str(uuid.uuid4())
+            item = {
+                "id": item_id,
+                "contador": st.session_state.manual_contador,
                 "cedula": cedula_normalizada,
-                "nombre": None,
-                "fechas": [fecha_atencion],
-                "cedula_padre": None,
-                "cedula_titular": None,
+                "fecha_atencion": fecha_atencion,
+                "dependencia": dependencia,
+                "fecha_nacimiento": fecha_nacimiento,
+                "sexo": sexo,
+                "observaciones": observaciones,
+                "responsable": responsable,
+                "hay_matriz": hay_matriz_disponible,
             }
+            st.session_state.manual_items.insert(0, {
+                "id": item_id, "cedula": cedula_normalizada,
+                "fecha": fecha_atencion.strftime("%d-%m-%Y"),
+                "estado": "En cola", "nombre": None, "detalle": "", "filas_matriz": [],
+                "original": item,
+            })
+            st.session_state.manual_queue_in.put(item)
 
-            log_buffer = io.StringIO()
-            with st.spinner(f"Consultando cobertura de {cedula_normalizada}..."):
-                try:
-                    with contextlib.redirect_stdout(log_buffer):
-                        filas_matriz = motor.procesar_registro(
-                            reg, contador, contador, driver_holder, carpeta_descargas_temp, carpeta_diagnostico,
-                            st.session_state.manual_errores, st.session_state.manual_sin_seguro,
-                            recolectar_matriz=True
-                        )
-                        motor.guardar_datos_paciente(
-                            cedula_normalizada, nombre=reg.get("nombre"),
-                            fecha_nacimiento=fecha_nacimiento, sexo=sexo
-                        )
-                        filas_escritas = []
-                        if hay_matriz_disponible and filas_matriz:
-                            try:
-                                filas_escritas = motor.agregar_filas_matriz_con_bloqueo(
-                                    filas_matriz, dependencia, fecha_nacimiento, sexo, observaciones, responsable
-                                )
-                            except TimeoutError as e:
-                                st.session_state.manual_errores.append(
-                                    [reg.get("nombre") or cedula_normalizada, cedula_normalizada,
-                                     fecha_atencion.strftime("%d-%m-%Y"), f"(MATRIZ) {e}"]
-                                )
-                    st.session_state.manual_ultimo_resultado = {
-                        "cedula": cedula_normalizada,
-                        "nombre": reg.get("nombre"),
-                        "log": log_buffer.getvalue(),
-                        "filas_matriz": filas_escritas,
-                        "error_fatal": None,
-                    }
-                except Exception as e:
-                    st.session_state.manual_ultimo_resultado = {
-                        "cedula": cedula_normalizada,
-                        "nombre": reg.get("nombre"),
-                        "log": log_buffer.getvalue(),
-                        "filas_matriz": [],
-                        "error_fatal": f"{type(e).__name__}: {e}",
-                    }
+            # Limpia el formulario para el siguiente paciente. Se conserva
+            # SOLO el responsable (key "manual_responsable", que queda
+            # intacto porque no se toca aqui); todo lo demas, incluida la
+            # dependencia, vuelve a su valor por defecto (la fecha de
+            # atencion vuelve a ser la de hoy).
+            for k in ("manual_cedula", "manual_fecha_atencion", "manual_fecha_nac", "manual_sexo",
+                      "manual_dependencia", "manual_dependencia_otra", "manual_observaciones",
+                      "manual_cedula_buscada", "manual_datos_previos"):
+                st.session_state.pop(k, None)
             st.rerun()
 
-    resultado = st.session_state.manual_ultimo_resultado
-    if resultado:
-        st.markdown("---")
-        st.markdown(f"**Resultado — cédula {resultado['cedula']}**"
-                     + (f" ({resultado['nombre']})" if resultado.get("nombre") else ""))
-        if resultado["error_fatal"]:
-            st.error(resultado["error_fatal"])
-        else:
-            st.success("Consulta procesada.")
-            if resultado["filas_matriz"]:
-                for ruta_m, fila in resultado["filas_matriz"]:
-                    st.write(f"→ Fila {fila} agregada a la matriz ({os.path.basename(ruta_m)}).")
-        if resultado["log"].strip():
-            with st.expander("Detalle técnico"):
-                st.code(resultado["log"], language=None)
+    # --- Drena resultados que el hilo de trabajo ya vaya terminando ---
+    try:
+        while True:
+            tipo, item_id, datos = st.session_state.manual_queue_out.get_nowait()
+            for it in st.session_state.manual_items:
+                if it["id"] != item_id:
+                    continue
+                if tipo == "procesando":
+                    it["estado"] = "Procesando..."
+                elif tipo == "listo":
+                    it["estado"] = "Listo"
+                    it["nombre"] = datos.get("nombre")
+                    it["detalle"] = datos.get("log", "")
+                    it["filas_matriz"] = datos.get("filas_matriz", [])
+                    st.session_state.manual_errores.extend(datos.get("errores", []))
+                    st.session_state.manual_sin_seguro.extend(datos.get("sin_seguro", []))
+                elif tipo == "error":
+                    it["estado"] = "Error"
+                    it["detalle"] = datos.get("detalle", "")
+                break
+    except queue.Empty:
+        pass
 
     st.markdown("---")
-    col_fin1, col_fin2 = st.columns(2)
+    st.markdown("**Cola de pacientes de esta sesión**")
+    if not st.session_state.manual_items:
+        st.caption("Todavía no has agregado ningún paciente.")
+    else:
+        iconos = {"En cola": "🕓", "Procesando...": "⏳", "Listo": "✅", "Error": "❌"}
+        for it in st.session_state.manual_items:
+            etiqueta = f"{iconos.get(it['estado'], '')} {it['cedula']} — {it['fecha']} — {it['estado']}"
+            if it.get("nombre"):
+                etiqueta += f" ({it['nombre']})"
+            with st.expander(etiqueta, expanded=(it["estado"] == "Error")):
+                if it["filas_matriz"]:
+                    for ruta_m, fila in it["filas_matriz"]:
+                        st.write(f"→ Fila {fila} agregada a la matriz ({os.path.basename(ruta_m)}).")
+                if it["detalle"].strip():
+                    st.code(it["detalle"], language=None)
+                if it["estado"] == "Error" and st.button("🔁 Reintentar este paciente", key=f"retry_{it['id']}"):
+                    nuevo_id = str(uuid.uuid4())
+                    nuevo_item = dict(it["original"])
+                    nuevo_item["id"] = nuevo_id
+                    st.session_state.manual_items.insert(0, {
+                        "id": nuevo_id, "cedula": it["cedula"], "fecha": it["fecha"],
+                        "estado": "En cola", "nombre": None, "detalle": "", "filas_matriz": [],
+                        "original": nuevo_item,
+                    })
+                    st.session_state.manual_queue_in.put(nuevo_item)
+                    st.rerun()
+
+    if any(it["estado"] in ("En cola", "Procesando...") for it in st.session_state.manual_items):
+        time.sleep(1.2)
+        st.rerun()
+
+    st.markdown("---")
+    col_fin1, col_fin2, col_fin3, col_fin4 = st.columns(4)
     with col_fin1:
         if st.button("🧾 Generar reportes de esta sesión (errores / sin seguro)"):
             motor._guardar_reportes_finales(st.session_state.manual_errores, st.session_state.manual_sin_seguro)
-            st.success("Reportes generados en la carpeta PDF_DESCARGADOS del servidor.")
+            st.success("Reportes generados.")
+            _drive_sincronizar_ahora()
             ruta_log = os.path.join(motor.CARPETA_SALIDA, "log_errores.xlsx")
             ruta_ss = os.path.join(motor.CARPETA_SALIDA, "sin_seguro.xlsx")
             if os.path.exists(ruta_log):
@@ -473,16 +939,16 @@ with tab_manual:
             if os.path.exists(ruta_ss):
                 with open(ruta_ss, "rb") as f:
                     st.download_button("⬇️ sin_seguro.xlsx", f.read(), file_name="sin_seguro.xlsx", key="dl_man_ss")
-
     with col_fin2:
         if st.button("🛑 Cerrar sesión de navegador"):
-            if st.session_state.manual_driver_holder is not None:
-                try:
-                    st.session_state.manual_driver_holder[0].quit()
-                except Exception:
-                    pass
-                st.session_state.manual_driver_holder = None
-            st.success("Navegador cerrado. Puedes seguir ingresando pacientes; se abrirá uno nuevo.")
+            st.session_state.manual_queue_in.put({"accion": "cerrar_driver"})
+            st.success("Se cerrará el navegador en cuanto termine el paciente actual (si hay alguno en curso).")
+    with col_fin3:
+        _boton_descargar_zip("📦 Descargar todos los PDF (.zip)", key="zip_manual")
+    with col_fin4:
+        if st.session_state.get("drive_carpeta_unidad_id") and st.button("☁️ Guardar en la nube ahora", key="sync_manual"):
+            _drive_sincronizar_ahora()
+            st.success("Guardado en Google Drive.")
 
     if hay_matriz_disponible:
         with st.expander("📋 Generar copia de la matriz para revisar/enviar"):
