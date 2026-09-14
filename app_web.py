@@ -1,333 +1,526 @@
 # -*- coding: utf-8 -*-
 """
-drive_utils.py - Conexion con Google Drive para PLANILLAJE COBERTURAS.
+app_web.py - Version web (Streamlit) de descargar_coberturas.py, con
+login por unidad y sincronizacion con Google Drive.
 
-Estructura esperada (Unidad Compartida "PLANILLAJE COBERTURAS"):
+Reutiliza el motor real (descargar_coberturas.py, aqui "core"):
+  - core.crear_driver() / procesar_registro() / procesar_lote()
+  - core.localizar_archivo_matriz() / agregar_filas_matriz_con_bloqueo()
 
-    PLANILLAJE COBERTURAS/  (Unidad Compartida)
-      <NOMBRE DE LA UNIDAD>/        p.ej. "CENTRO DE SALUD COLINAS DEL NORTE"
-        2026/
-          9 SEPTIEMBRE/
-            INSTRUCTIVO5 SEPTIEMBRE 2026.xlsx
-            IESS/
-            CAMPESINO/
-            ISSFA/
-            ISSPOL/
+Y drive_utils.py para:
+  - Login por unidad (st.secrets["usuarios"])
+  - Bajar el INSTRUCTIVO del mes actual desde Drive al iniciar sesion
+  - Subir la matriz + clasificar y subir cada PDF a IESS/CAMPESINO/
+    ISSFA/ISSPOL dentro de PLANILLAJE COBERTURAS/<unidad>/<año>/<mes>
 
-No se toca nada de descargar_coberturas.py: este modulo solo mueve
-archivos hacia/desde Drive. La logica real de descarga y de llenado de
-la matriz sigue siendo la de "core" (descargar_coberturas.py), operando
-sobre una copia local mientras corre la sesion.
+REQUISITOS (junto a este archivo, descargar_coberturas.py y drive_utils.py):
 
-CREDENCIALES: requiere que en st.secrets exista la seccion
-[gcp_service_account] (la cuenta de servicio ya creada, con la Unidad
-Compartida "PLANILLAJE COBERTURAS" compartida con su correo como
-"Administrador de contenido" o superior).
+  packages.txt:
+      chromium
+      chromium-driver
 
-IMPORTANTE: no se pudo probar contra la API real de Drive desde este
-entorno (sin acceso a internet aqui), asi que antes de usarlo en un
-lote real conviene probar primero con "probar_conexion()" (mas abajo)
-o el boton de diagnostico que se agrega en app_web.py.
+  requirements.txt:
+      streamlit>=1.31
+      selenium
+      webdriver-manager
+      openpyxl
+      pypdf
+      google-api-python-client
+      google-auth
+
+  Secrets de la app (Settings -> Secrets en Streamlit Cloud):
+      [usuarios]  -> ya lo tienes (clave = nombre de unidad, password, nombre)
+      [gcp_service_account] -> la cuenta de servicio (rotada tras el
+      incidente de esta conversacion, la version anterior quedo expuesta)
 """
 
-import io
 import os
-import re
-import unicodedata
+import io
+import zipfile
+import contextlib
+from datetime import datetime, date
 
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
-from google.oauth2 import service_account
+import streamlit as st
 
-NOMBRE_UNIDAD_COMPARTIDA = "PLANILLAJE COBERTURAS"
-CARPETAS_TIPO_SEGURO = ["IESS", "CAMPESINO", "ISSFA", "ISSPOL"]
+import descargar_coberturas as core
+import drive_utils as drv
 
-MIME_CARPETA = "application/vnd.google-apps.folder"
-MIME_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+st.set_page_config(page_title="Coberturas CORESALUD", layout="wide", page_icon="📋")
 
-MESES_ES = [
-    "ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
-    "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE",
+DEPENDENCIAS_RESPALDO = [
+    "GINECOLOGIA (CE)", "MEDICINA FAMILIAR", "MEDICINA GENERAL (CE)",
+    "OBSTETRICIA (CE)", "PEDIATRIA (CE)", "PSICOLOGIA (CE)", "NUTRICION Y DIETETICA",
 ]
 
+st.markdown("""
+<style>
+div.block-container{padding-top:1.2rem; padding-bottom:1rem; max-width:1150px;}
+h1{font-size:1.6rem !important; margin-bottom:0.6rem !important;}
+h2, h3{font-size:1.05rem !important;}
+label, .stMarkdown p{font-size:0.85rem !important;}
+div[data-testid="stTextInput"] input, div[data-testid="stDateInput"] input,
+div[data-testid="stSelectbox"] div, div[data-testid="stNumberInput"] input{
+    font-size:0.85rem !important; padding:0.35rem 0.5rem !important;
+}
+button{font-size:0.82rem !important; padding:0.3rem 0.9rem !important;}
+div[data-testid="stDataFrame"]{font-size:0.8rem !important;}
+</style>
+""", unsafe_allow_html=True)
 
-def _quitar_tildes(txt):
-    return "".join(
-        c for c in unicodedata.normalize("NFD", txt or "") if unicodedata.category(c) != "Mn"
+# ============================================================
+# LOGIN POR UNIDAD
+# ============================================================
+
+
+def _pantalla_login():
+    st.title("📋 Descarga de Coberturas - CORESALUD")
+    st.subheader("Iniciar sesión")
+    usuarios = dict(st.secrets.get("usuarios", {}))
+    if not usuarios:
+        st.error("No hay unidades configuradas en los Secrets de la app (sección [usuarios]).")
+        return
+
+    claves = list(usuarios.keys())
+    clave = st.selectbox("Unidad:", claves, format_func=lambda k: usuarios[k]["nombre"])
+    contrasena = st.text_input("Contraseña:", type="password", key="campo_password_login")
+
+    if st.button("Ingresar", type="primary"):
+        if contrasena == usuarios[clave]["password"]:
+            st.session_state.unidad = {"clave": clave, "nombre": usuarios[clave]["nombre"]}
+            st.rerun()
+        else:
+            st.error("Contraseña incorrecta.")
+
+
+# ============================================================
+# LOG EN VIVO
+# ============================================================
+
+
+class _EscritorLog(io.TextIOBase):
+    def __init__(self, placeholder, buffer_key):
+        self.placeholder = placeholder
+        self.buffer_key = buffer_key
+
+    def write(self, texto):
+        if texto:
+            st.session_state[self.buffer_key] += texto
+            self.placeholder.code(st.session_state[self.buffer_key][-4000:], language="bash")
+        return len(texto)
+
+    def flush(self):
+        pass
+
+
+@contextlib.contextmanager
+def log_en_vivo(placeholder, buffer_key):
+    st.session_state[buffer_key] = ""
+    with contextlib.redirect_stdout(_EscritorLog(placeholder, buffer_key)):
+        yield
+
+
+# ============================================================
+# GOOGLE DRIVE: conexion, matriz del mes, sincronizacion
+# ============================================================
+
+
+def _servicio_drive():
+    if "gcp_service_account" not in st.secrets:
+        return None
+    try:
+        return drv.obtener_servicio_drive(st.secrets["gcp_service_account"])
+    except Exception as e:
+        st.error(f"No se pudo conectar con Google Drive: {e}")
+        return None
+
+
+def _carpeta_mes_actual(servicio, fecha=None):
+    drive_id = drv.id_unidad_compartida(servicio)
+    nombre_unidad = st.session_state.unidad["nombre"]
+    id_carpeta_mes = drv.carpeta_de_unidad_anio_mes(servicio, drive_id, nombre_unidad, fecha or date.today())
+    ids_tipo = drv.asegurar_subcarpetas_tipo_seguro(servicio, drive_id, id_carpeta_mes)
+    return drive_id, id_carpeta_mes, ids_tipo
+
+
+def _asegurar_matriz_desde_drive():
+    """Antes de procesar cualquier paciente, se asegura de tener local
+    (en core.BASE_DIR) el INSTRUCTIVO del mes actual de ESTA unidad,
+    bajandolo de Drive si hace falta. Se hace una sola vez por sesion."""
+    if st.session_state.get("matriz_lista"):
+        return True
+
+    servicio = _servicio_drive()
+    if servicio is None:
+        return False
+
+    try:
+        drive_id, id_carpeta_mes, _ = _carpeta_mes_actual(servicio)
+        archivo = drv.buscar_archivo_por_patron(servicio, drive_id, id_carpeta_mes, r"^INSTRUCTIVO.*\.xlsx$")
+        if archivo is not None:
+            destino = os.path.join(core.BASE_DIR, archivo["name"])
+            drv.descargar_archivo(servicio, archivo["id"], destino)
+            st.session_state.matriz_lista = True
+            return True
+    except Exception as e:
+        st.warning(f"No se pudo revisar la matriz en Drive: {e}")
+
+    # Todavia no hay ningun INSTRUCTIVO para esta unidad/mes en Drive:
+    # se deja subir uno una sola vez (queda local y se sube a Drive de una vez)
+    st.warning(
+        f"No hay ninguna plantilla 'INSTRUCTIVO...xlsx' en Drive para "
+        f"{st.session_state.unidad['nombre']} este mes. Subela una sola vez."
     )
+    plantilla = st.file_uploader("Subir plantilla INSTRUCTIVO (.xlsx)", type=["xlsx"], key="plantilla_instructivo")
+    if plantilla is not None:
+        destino = os.path.join(core.BASE_DIR, plantilla.name)
+        with open(destino, "wb") as f:
+            f.write(plantilla.getbuffer())
+        try:
+            drive_id, id_carpeta_mes, _ = _carpeta_mes_actual(servicio)
+            drv.subir_o_reemplazar_archivo(servicio, destino, plantilla.name, id_carpeta_mes, drv.MIME_XLSX)
+            st.success("Plantilla guardada y subida a Drive.")
+        except Exception as e:
+            st.warning(f"Se guardó localmente pero no se pudo subir a Drive todavía: {e}")
+        st.session_state.matriz_lista = True
+        st.rerun()
+    return False
 
 
-# ============================================================
-# AUTENTICACION
-# ============================================================
+def _sincronizar_con_drive():
+    servicio = _servicio_drive()
+    if servicio is None:
+        st.error("No hay credenciales de Google Drive configuradas (gcp_service_account).")
+        return
 
-_SERVICIO = None
+    with st.spinner("Sincronizando con Drive..."):
+        try:
+            drive_id, id_carpeta_mes, ids_tipo = _carpeta_mes_actual(servicio)
+        except Exception as e:
+            st.error(f"No se pudo ubicar la carpeta en Drive: {e}")
+            return
 
+        try:
+            ruta_matriz = core.localizar_archivo_matriz()
+            drv.subir_o_reemplazar_archivo(
+                servicio, ruta_matriz, os.path.basename(ruta_matriz), id_carpeta_mes, drv.MIME_XLSX
+            )
+        except FileNotFoundError:
+            pass
 
-def obtener_servicio_drive(secrets_gcp):
-    """secrets_gcp: st.secrets['gcp_service_account'] (dict-like)."""
-    global _SERVICIO
-    if _SERVICIO is not None:
-        return _SERVICIO
-    credenciales = service_account.Credentials.from_service_account_info(
-        dict(secrets_gcp), scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    _SERVICIO = build("drive", "v3", credentials=credenciales)
-    return _SERVICIO
+        subidos, sin_clasificar = 0, []
+        if os.path.isdir(core.CARPETA_SALIDA):
+            for raiz, _, archivos in os.walk(core.CARPETA_SALIDA):
+                if os.path.basename(raiz) in ("_descargas_temp", "_diagnostico"):
+                    continue
+                for nombre_archivo in archivos:
+                    if not nombre_archivo.lower().endswith(".pdf"):
+                        continue
+                    ruta_completa = os.path.join(raiz, nombre_archivo)
+                    with open(ruta_completa, "rb") as f:
+                        contenido = f.read()
+                    texto = core.texto_pdf(contenido)
+                    esquema = drv.determinar_esquema_cobertura(texto, core.es_campesino)
+                    if esquema is None:
+                        sin_clasificar.append(nombre_archivo)
+                        continue
+                    ruta_relativa = os.path.relpath(ruta_completa, core.CARPETA_SALIDA)
+                    nombre_drive = ruta_relativa.replace(os.sep, " - ")
+                    drv.subir_o_reemplazar_archivo(
+                        servicio, ruta_completa, nombre_drive, ids_tipo[esquema], "application/pdf"
+                    )
+                    subidos += 1
 
-
-# ============================================================
-# NAVEGACION DE CARPETAS
-# ============================================================
-
-
-def listar_unidades_compartidas_visibles(servicio):
-    """Todas las Unidades Compartidas (Shared Drives) que esta cuenta de
-    servicio puede ver ahora mismo, sin filtrar por nombre. Util para
-    diagnosticar: si esta lista sale vacia, el problema es de permisos
-    (no se comparti\u00f3 la Unidad Compartida en si con el correo de la
-    cuenta de servicio, o solo se comparti\u00f3 una carpeta de adentro)."""
-    vistas = []
-    token = None
-    while True:
-        resultado = servicio.drives().list(
-            pageSize=100, pageToken=token, fields="nextPageToken, drives(id, name)"
-        ).execute()
-        vistas += resultado.get("drives", [])
-        token = resultado.get("nextPageToken")
-        if not token:
-            break
-    return vistas
-
-
-def id_unidad_compartida(servicio, nombre=NOMBRE_UNIDAD_COMPARTIDA):
-    visibles = listar_unidades_compartidas_visibles(servicio)
-
-    objetivo = nombre.strip().casefold()
-    for unidad in visibles:
-        if unidad["name"].strip().casefold() == objetivo:
-            return unidad["id"]
-
-    if not visibles:
-        raise FileNotFoundError(
-            f"Esta cuenta de servicio no ve NINGUNA Unidad Compartida (0 resultados). "
-            f"Seguramente se compartio una carpeta de ADENTRO de '{nombre}' con su correo, "
-            "en vez de compartir la Unidad Compartida completa. Hay que compartir la Unidad "
-            "Compartida en si (clic derecho sobre su nombre en la barra lateral de Drive -> "
-            "'Administrar miembros' / 'Compartir') como Administrador de contenido."
+    mensaje = f"✅ Sincronizado: {subidos} PDF(s) subidos a IESS/CAMPESINO/ISSFA/ISSPOL y matriz actualizada en Drive."
+    st.success(mensaje)
+    if sin_clasificar:
+        st.warning(
+            f"{len(sin_clasificar)} PDF(s) no se pudieron clasificar (ninguna fila de la tabla "
+            f"decía 'SI REGISTRA COBERTURA'; revísalos a mano): " + ", ".join(sin_clasificar)
         )
 
-    nombres_vistos = ", ".join(f"'{u['name']}'" for u in visibles)
-    raise FileNotFoundError(
-        f"Esta cuenta de servicio SI ve Unidades Compartidas, pero ninguna se llama "
-        f"exactamente '{nombre}'. Las que ve son: {nombres_vistos}. "
-        "Revisa mayusculas/espacios, o ajusta NOMBRE_UNIDAD_COMPARTIDA en drive_utils.py."
+
+# ============================================================
+# UTILIDADES DE PROCESAMIENTO (compartidas por lotes y manual)
+# ============================================================
+
+
+def _zip_resultado():
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        if os.path.isdir(core.CARPETA_SALIDA):
+            for raiz, _, archivos in os.walk(core.CARPETA_SALIDA):
+                if os.path.basename(raiz) in ("_descargas_temp", "_diagnostico"):
+                    continue
+                for nombre_archivo in archivos:
+                    ruta_completa = os.path.join(raiz, nombre_archivo)
+                    ruta_relativa = os.path.relpath(ruta_completa, core.CARPETA_SALIDA)
+                    zf.write(ruta_completa, os.path.join("PDF_DESCARGADOS", ruta_relativa))
+        try:
+            ruta_matriz = core.localizar_archivo_matriz()
+            zf.write(ruta_matriz, os.path.basename(ruta_matriz))
+        except FileNotFoundError:
+            pass
+    buffer.seek(0)
+    return buffer
+
+
+def _obtener_driver(carpeta_descargas_temp):
+    if st.session_state.get("driver_compartido") is None:
+        print("Iniciando Chrome (headless)...")
+        st.session_state.driver_compartido = [core.crear_driver(carpeta_descargas_temp)]
+    return st.session_state.driver_compartido
+
+
+def _cerrar_driver():
+    driver_holder = st.session_state.get("driver_compartido")
+    if driver_holder is not None:
+        try:
+            driver_holder[0].quit()
+        except Exception:
+            pass
+        st.session_state.driver_compartido = None
+
+
+def _procesar_un_registro(driver_holder, carpeta_descargas_temp, carpeta_diagnostico, reg, datos_matriz):
+    errores, sin_seguro = [], []
+    filas_matriz = core.procesar_registro(
+        reg, 1, 1, driver_holder, carpeta_descargas_temp, carpeta_diagnostico,
+        errores, sin_seguro, recolectar_matriz=True,
     )
-
-
-def buscar_subcarpeta(servicio, drive_id, id_padre, nombre_exacto):
-    nombre_escapado = nombre_exacto.replace("'", "\\'")
-    q = (
-        f"'{id_padre}' in parents and name = '{nombre_escapado}' "
-        f"and mimeType = '{MIME_CARPETA}' and trashed = false"
-    )
-    resultado = servicio.files().list(
-        q=q, corpora="drive", driveId=drive_id, includeItemsFromAllDrives=True,
-        supportsAllDrives=True, fields="files(id, name)",
-    ).execute()
-    archivos = resultado.get("files", [])
-    return archivos[0]["id"] if archivos else None
-
-
-def crear_subcarpeta(servicio, drive_id, id_padre, nombre):
-    metadata = {"name": nombre, "mimeType": MIME_CARPETA, "parents": [id_padre]}
-    carpeta = servicio.files().create(
-        body=metadata, supportsAllDrives=True, fields="id"
-    ).execute()
-    return carpeta["id"]
-
-
-def buscar_o_crear_subcarpeta(servicio, drive_id, id_padre, nombre):
-    id_existente = buscar_subcarpeta(servicio, drive_id, id_padre, nombre)
-    return id_existente or crear_subcarpeta(servicio, drive_id, id_padre, nombre)
-
-
-def buscar_archivo_por_patron(servicio, drive_id, id_padre, patron_regex):
-    """Busca, entre los archivos DENTRO de id_padre (no subcarpetas), el
-    primero cuyo nombre haga match con patron_regex (case-insensitive).
-    Se usa para encontrar 'INSTRUCTIVO...xlsx' sin saber el nombre exacto."""
-    resultado = servicio.files().list(
-        q=f"'{id_padre}' in parents and trashed = false",
-        corpora="drive", driveId=drive_id, includeItemsFromAllDrives=True,
-        supportsAllDrives=True, fields="files(id, name, mimeType)",
-    ).execute()
-    expresion = re.compile(patron_regex, re.IGNORECASE)
-    for archivo in resultado.get("files", []):
-        if archivo["mimeType"] != MIME_CARPETA and expresion.search(archivo["name"]):
-            return archivo
-    return None
-
-
-def carpeta_de_unidad_anio_mes(servicio, drive_id, nombre_unidad, fecha, crear_si_falta=True):
-    """Navega Unidad Compartida -> <nombre_unidad> -> <año> -> '<mes_num> <MES>'.
-    Devuelve el id de la carpeta del mes. Si crear_si_falta=True, crea la
-    cadena de carpetas que falte (no debería hacer falta para el año/mes,
-    pero sí sirve para robustez si todavia no existe ese mes).
-
-    La carpeta de cada unidad vive directamente en la raíz de la Unidad
-    Compartida, así que su "padre" es el propio drive_id (en la API de
-    Drive, el id de la raíz de una Unidad Compartida es igual a su
-    driveId)."""
-    id_carpeta_unidad = buscar_subcarpeta(servicio, drive_id, drive_id, nombre_unidad)
-    if id_carpeta_unidad is None:
-        if not crear_si_falta:
-            raise FileNotFoundError(f"No existe la carpeta de la unidad '{nombre_unidad}' en Drive.")
-        id_carpeta_unidad = crear_subcarpeta(servicio, drive_id, id_unidad, nombre_unidad)
-
-    nombre_anio = str(fecha.year)
-    id_carpeta_anio = buscar_subcarpeta(servicio, drive_id, id_carpeta_unidad, nombre_anio)
-    if id_carpeta_anio is None:
-        if not crear_si_falta:
-            raise FileNotFoundError(f"No existe la carpeta '{nombre_anio}' dentro de '{nombre_unidad}'.")
-        id_carpeta_anio = crear_subcarpeta(servicio, drive_id, id_carpeta_unidad, nombre_anio)
-
-    nombre_mes = f"{fecha.month} {MESES_ES[fecha.month - 1]}"
-    id_carpeta_mes = buscar_subcarpeta(servicio, drive_id, id_carpeta_anio, nombre_mes)
-    if id_carpeta_mes is None:
-        # por si el mes ya existe pero con otro formato de nombre (p.ej.
-        # solo "SEPTIEMBRE" o con guiones), se busca de forma mas flexible
-        # antes de crear uno nuevo y terminar con dos carpetas del mismo mes
-        resultado = servicio.files().list(
-            q=f"'{id_carpeta_anio}' in parents and mimeType = '{MIME_CARPETA}' and trashed = false",
-            corpora="drive", driveId=drive_id, includeItemsFromAllDrives=True,
-            supportsAllDrives=True, fields="files(id, name)",
-        ).execute()
-        patron = re.compile(re.escape(MESES_ES[fecha.month - 1]), re.IGNORECASE)
-        for carpeta in resultado.get("files", []):
-            if patron.search(_quitar_tildes(carpeta["name"]).upper()):
-                id_carpeta_mes = carpeta["id"]
-                break
-
-    if id_carpeta_mes is None:
-        if not crear_si_falta:
-            raise FileNotFoundError(f"No existe la carpeta del mes '{nombre_mes}'.")
-        id_carpeta_mes = crear_subcarpeta(servicio, drive_id, id_carpeta_anio, nombre_mes)
-
-    return id_carpeta_mes
-
-
-def asegurar_subcarpetas_tipo_seguro(servicio, drive_id, id_carpeta_mes):
-    """Devuelve {'IESS': id, 'CAMPESINO': id, 'ISSFA': id, 'ISSPOL': id},
-    creando las que falten."""
-    ids = {}
-    for nombre in CARPETAS_TIPO_SEGURO:
-        ids[nombre] = buscar_o_crear_subcarpeta(servicio, drive_id, id_carpeta_mes, nombre)
-    return ids
+    if filas_matriz:
+        try:
+            filas = core.agregar_filas_matriz_con_bloqueo(
+                filas_matriz, datos_matriz["dependencia"], datos_matriz["fecha_nacimiento"],
+                datos_matriz["sexo"], datos_matriz["observaciones"], datos_matriz["responsable"],
+            )
+            return f"OK ({len(filas)} fila(s))"
+        except TimeoutError as e:
+            return f"ERROR matriz: {e}"
+    elif errores:
+        return f"ERROR: {errores[-1][-1]}"
+    elif sin_seguro:
+        return "SIN SEGURO"
+    return "ERROR: sin resultado"
 
 
 # ============================================================
-# DESCARGA / SUBIDA DE ARCHIVOS
+# INTERFAZ
 # ============================================================
 
+if "unidad" not in st.session_state:
+    _pantalla_login()
+    st.stop()
 
-def descargar_archivo(servicio, file_id, ruta_destino):
-    request = servicio.files().get_media(fileId=file_id, supportsAllDrives=True)
-    with io.FileIO(ruta_destino, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request)
-        listo = False
-        while not listo:
-            _, listo = downloader.next_chunk()
-    return ruta_destino
+for clave, valor in {
+    "historial_manual": [], "fallidos_lote": [], "errores_lote_acum": [],
+    "sin_seguro_lote_acum": [], "driver_compartido": None, "matriz_lista": False,
+}.items():
+    if clave not in st.session_state:
+        st.session_state[clave] = valor
 
+col_titulo, col_sesion = st.columns([3, 1])
+with col_titulo:
+    st.title("📋 Descarga de Coberturas - CORESALUD")
+with col_sesion:
+    st.write("")
+    st.caption(f"Sesión: **{st.session_state.unidad['nombre']}**")
+    if st.button("🔴 Cerrar sesión"):
+        _cerrar_driver()
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
 
-def subir_o_reemplazar_archivo(servicio, ruta_local, nombre_archivo, id_carpeta, mime_type):
-    """Si ya existe un archivo con ese nombre en la carpeta, lo actualiza
-    (mantiene el mismo file_id / enlace); si no, lo crea."""
-    resultado = servicio.files().list(
-        q=f"'{id_carpeta}' in parents and name = '{nombre_archivo}' and trashed = false",
-        supportsAllDrives=True, includeItemsFromAllDrives=True, fields="files(id)",
-    ).execute()
-    media = MediaFileUpload(ruta_local, mimetype=mime_type, resumable=True)
-    existentes = resultado.get("files", [])
-    if existentes:
-        return servicio.files().update(
-            fileId=existentes[0]["id"], media_body=media, supportsAllDrives=True
-        ).execute()
-    metadata = {"name": nombre_archivo, "parents": [id_carpeta]}
-    return servicio.files().create(
-        body=metadata, media_body=media, supportsAllDrives=True, fields="id"
-    ).execute()
+hay_matriz = _asegurar_matriz_desde_drive()
+if not hay_matriz:
+    st.stop()
 
+tab_lotes, tab_manual = st.tabs(["📁 Por lotes", "👤 Paciente manual"])
 
-# ============================================================
-# CLASIFICACION DEL PDF: IESS / CAMPESINO / ISSFA / ISSPOL
-# ============================================================
-#
-# El PDF de coberturasalud.msp.gob.ec trae SIEMPRE una tabla con 3 filas
-# (IESS, ISSFA, ISSPOL) y, en la columna "Registro de Cobertura de
-# Atención de Salud", cada fila dice "SI REGISTRA COBERTURA" o "NO
-# REGISTRA COBERTURA". El motor actual (descargar_coberturas.py) solo
-# mira la fila IESS (estado_cobertura_iess); aqui se agrega el mismo
-# analisis para ISSFA e ISSPOL, sin tocar el archivo original.
+# ------------------------------------------------------------
+# PESTAÑA 1: POR LOTES
+# ------------------------------------------------------------
+with tab_lotes:
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        responsable_lote = st.text_input("Responsable:", key="resp_lote")
+    with c2:
+        archivo_subido = st.file_uploader(
+            "Excel de inconsistencias (.xlsx)", type=["xlsx"], key="excel_lote"
+        )
 
+    log_lotes = st.empty()
+    barra_lotes = st.empty()
 
-def _estado_fila(texto_sin_tildes, etiqueta, limite):
-    patron = rf"\b{re.escape(etiqueta)}\b(?:(?!\b{re.escape(limite)}\b).)*?(SI REGISTRA COBERTURA|NO REGISTRA COBERTURA)"
-    m = re.search(patron, texto_sin_tildes, re.DOTALL)
-    if not m:
-        return None
-    return m.group(1) == "SI REGISTRA COBERTURA"
+    def _correr_lote(items, titulo_boton_zip):
+        os.makedirs(core.CARPETA_SALIDA, exist_ok=True)
+        carpeta_descargas_temp = os.path.join(core.CARPETA_SALIDA, "_descargas_temp")
+        os.makedirs(carpeta_descargas_temp, exist_ok=True)
+        carpeta_diagnostico = os.path.join(core.CARPETA_SALIDA, "_diagnostico")
 
+        with log_en_vivo(log_lotes, "log_buffer_lote"):
+            driver_holder = _obtener_driver(carpeta_descargas_temp)
+            errores, sin_seguro = [], []
+            total = len(items)
 
-def determinar_esquema_cobertura(texto_pdf, es_campesino_fn):
-    """Devuelve 'ISSFA', 'ISSPOL', 'CAMPESINO' o 'IESS' segun cual fila de
-    la tabla del PDF confirma cobertura ('SI REGISTRA COBERTURA'). Si
-    ninguna fila la confirma, devuelve None (sin seguro / indeterminado;
-    ese caso ya se reporta aparte como sin_seguro/errores y no debe
-    subirse a ninguna carpeta).
+            def _progreso(n, total_):
+                barra_lotes.progress(n / total_, text=f"{n}/{total_} procesado(s)")
 
-    es_campesino_fn: pasar core.es_campesino (se inyecta desde afuera
-    para no duplicar esa deteccion aqui)."""
-    t = _quitar_tildes(texto_pdf or "").upper()
+            core.procesar_lote(
+                items, driver_holder, carpeta_descargas_temp, carpeta_diagnostico,
+                errores, sin_seguro, callback_progreso=_progreso,
+                escribir_matriz=True, responsable_matriz=responsable_lote,
+            )
+            core._guardar_reportes_finales(errores, sin_seguro)
 
-    if _estado_fila(t, "ISSFA", "ISSPOL") is True:
-        return "ISSFA"
-    if _estado_fila(t, "ISSPOL", "RED PRIVADA") is True:
-        return "ISSPOL"
-    if _estado_fila(t, "IESS", "ISSFA") is True:
-        return "CAMPESINO" if es_campesino_fn(texto_pdf) else "IESS"
-    return None
+        cedulas_con_error = {fila[1] for fila in errores}
+        st.session_state.fallidos_lote = [
+            (indice, reg) for indice, reg in items if reg["cedula"] in cedulas_con_error
+        ]
+        st.session_state.errores_lote_acum += errores
+        st.session_state.sin_seguro_lote_acum += sin_seguro
 
+        if st.session_state.fallidos_lote:
+            st.warning(f"{len(st.session_state.fallidos_lote)} paciente(s) quedaron con error.")
+        else:
+            st.success("Lote terminado sin errores pendientes.")
 
-# ============================================================
-# DIAGNOSTICO (para probar la conexion antes de un lote real)
-# ============================================================
+        colz1, colz2 = st.columns(2)
+        with colz1:
+            st.download_button(
+                titulo_boton_zip, data=_zip_resultado(),
+                file_name=f"coberturas_{datetime.now():%Y%m%d_%H%M}.zip",
+                mime="application/zip", key=f"zip_{datetime.now().timestamp()}",
+            )
+        with colz2:
+            if st.button("☁️ Sincronizar con Drive", key=f"sync_{datetime.now().timestamp()}"):
+                _sincronizar_con_drive()
 
+    puede_iniciar = archivo_subido is not None
+    if st.button("🚀 Iniciar descarga por lotes", type="primary", disabled=not puede_iniciar):
+        ruta_temp_excel = os.path.join(core.BASE_DIR, "_subida_temp_lote.xlsx")
+        with open(ruta_temp_excel, "wb") as f:
+            f.write(archivo_subido.getbuffer())
+        registros = core.leer_excel(ruta_temp_excel)
+        items = list(enumerate(registros, start=1))
+        st.session_state.errores_lote_acum = []
+        st.session_state.sin_seguro_lote_acum = []
+        _correr_lote(items, "📦 Descargar PDFs + Matriz (.zip)")
 
-def probar_conexion(secrets_gcp, nombre_unidad):
-    """Devuelve una lista de mensajes de diagnostico (en vez de lanzar
-    excepciones sueltas), pensada para mostrarse directo en la app con
-    st.write(...) antes de confiar en la integracion para un lote real."""
-    mensajes = []
+    if st.session_state.fallidos_lote:
+        st.divider()
+        st.write(f"⚠️ **{len(st.session_state.fallidos_lote)} paciente(s) pendiente(s) de reintentar**:")
+        st.dataframe(
+            [{"Cédula": r["cedula"], "Nombre": r["nombre"]} for _, r in st.session_state.fallidos_lote],
+            use_container_width=True, height=150,
+        )
+        if st.button("🔁 Reintentar todos los fallidos", type="primary"):
+            _correr_lote(st.session_state.fallidos_lote, "📦 Descargar resultado del reintento (.zip)")
+
+# ------------------------------------------------------------
+# PESTAÑA 2: MANUAL
+# ------------------------------------------------------------
+with tab_manual:
     try:
-        servicio = obtener_servicio_drive(secrets_gcp)
-        mensajes.append("✅ Autenticación con la cuenta de servicio: OK")
-    except Exception as e:
-        mensajes.append(f"❌ No se pudo autenticar: {e}")
-        return mensajes
+        dependencias_validas = core.obtener_dependencias_validas(
+            core.abrir_matriz(core.localizar_archivo_matriz())
+        )
+    except Exception:
+        dependencias_validas = DEPENDENCIAS_RESPALDO
 
-    try:
-        drive_id = id_unidad_compartida(servicio)
-        mensajes.append(f"✅ Unidad Compartida '{NOMBRE_UNIDAD_COMPARTIDA}' encontrada.")
-    except Exception as e:
-        mensajes.append(f"❌ {e}")
-        return mensajes
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        responsable = st.text_input("Responsable:", key="campo_responsable")
+        cedula = st.text_input("Cédula (*):", key="campo_cedula")
+    with col2:
+        fecha_atencion = st.date_input(
+            "Fecha de atención (*):", value=datetime.now(), format="DD/MM/YYYY", key="campo_fecha_atencion"
+        )
+        fecha_nacimiento = st.date_input(
+            "Fecha de nacimiento (*):", value=None, format="DD/MM/YYYY", key="campo_fecha_nac"
+        )
+    with col3:
+        dependencia = st.selectbox("Dependencia:", dependencias_validas, key="campo_dependencia")
+        sexo = st.radio("Sexo (*):", ["M", "F"], horizontal=True, key="campo_sexo")
 
-    id_carpeta_unidad = buscar_subcarpeta(servicio, drive_id, drive_id, nombre_unidad)
-    if id_carpeta_unidad:
-        mensajes.append(f"✅ Carpeta de la unidad '{nombre_unidad}' encontrada.")
-    else:
-        mensajes.append(f"⚠️ No existe todavía una carpeta '{nombre_unidad}' dentro de "
-                         f"'{NOMBRE_UNIDAD_COMPARTIDA}' (se creará sola en el primer uso).")
+    observaciones = st.text_input("Observaciones:", key="campo_observaciones")
 
-    return mensajes
+    log_manual = st.empty()
+
+    if st.button("➕ Procesar y agregar a la matriz", type="primary"):
+        if not cedula or fecha_nacimiento is None:
+            st.error("Completa Cédula y Fecha de nacimiento.")
+        else:
+            reg = {
+                "cedula": cedula.strip().zfill(10), "nombre": None,
+                "fechas": [fecha_atencion], "cedula_padre": None, "cedula_titular": None,
+            }
+            datos_matriz = {
+                "dependencia": dependencia, "fecha_nacimiento": fecha_nacimiento,
+                "sexo": sexo, "observaciones": observaciones, "responsable": responsable,
+            }
+
+            with log_en_vivo(log_manual, "log_buffer_manual"):
+                os.makedirs(core.CARPETA_SALIDA, exist_ok=True)
+                carpeta_descargas_temp = os.path.join(core.CARPETA_SALIDA, "_descargas_temp")
+                os.makedirs(carpeta_descargas_temp, exist_ok=True)
+                carpeta_diagnostico = os.path.join(core.CARPETA_SALIDA, "_diagnostico")
+                driver_holder = _obtener_driver(carpeta_descargas_temp)
+
+                estado = _procesar_un_registro(
+                    driver_holder, carpeta_descargas_temp, carpeta_diagnostico, reg, datos_matriz
+                )
+
+            fila_historial = {
+                "Cédula": reg["cedula"], "Fecha": fecha_atencion.strftime("%d/%m/%Y"), "Estado": estado,
+            }
+            if estado.startswith("ERROR") or estado == "SIN SEGURO":
+                fila_historial["_reg"] = reg
+                fila_historial["_datos"] = datos_matriz
+            st.session_state.historial_manual.append(fila_historial)
+
+            for k in ("campo_cedula", "campo_fecha_nac", "campo_sexo", "campo_observaciones", "campo_dependencia"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    if st.session_state.historial_manual:
+        st.divider()
+        fallidos = [h for h in st.session_state.historial_manual if "_reg" in h]
+        st.write(f"**{len(st.session_state.historial_manual)} procesado(s) en esta sesión** "
+                 f"({len(fallidos)} con error)")
+        st.dataframe(
+            [{"Cédula": h["Cédula"], "Fecha": h["Fecha"], "Estado": h["Estado"]}
+             for h in st.session_state.historial_manual],
+            use_container_width=True, height=200,
+        )
+
+        cA, cB, cC, cD = st.columns(4)
+        with cA:
+            st.download_button(
+                "📦 Descargar .zip", data=_zip_resultado(),
+                file_name=f"coberturas_manual_{datetime.now():%Y%m%d_%H%M}.zip", mime="application/zip",
+            )
+        with cB:
+            if st.button("☁️ Sincronizar con Drive"):
+                _sincronizar_con_drive()
+        with cC:
+            if fallidos and st.button(f"🔁 Reintentar los {len(fallidos)} fallidos"):
+                os.makedirs(core.CARPETA_SALIDA, exist_ok=True)
+                carpeta_descargas_temp = os.path.join(core.CARPETA_SALIDA, "_descargas_temp")
+                os.makedirs(carpeta_descargas_temp, exist_ok=True)
+                carpeta_diagnostico = os.path.join(core.CARPETA_SALIDA, "_diagnostico")
+                driver_holder = _obtener_driver(carpeta_descargas_temp)
+
+                with log_en_vivo(log_manual, "log_buffer_manual"):
+                    for h in fallidos:
+                        estado = _procesar_un_registro(
+                            driver_holder, carpeta_descargas_temp, carpeta_diagnostico, h["_reg"], h["_datos"]
+                        )
+                        h["Estado"] = estado
+                        if not (estado.startswith("ERROR") or estado == "SIN SEGURO"):
+                            h.pop("_reg", None)
+                            h.pop("_datos", None)
+                st.rerun()
+        with cD:
+            if st.button("🔴 Cerrar Chrome"):
+                _cerrar_driver()
+                st.success("Chrome cerrado.")
