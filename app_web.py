@@ -18,6 +18,30 @@ Funciona igual en Windows o Linux: crear_driver() en el motor ya
 detecta automaticamente si existe Chromium/Chromedriver del sistema
 (tipico de un servidor Linux) o si debe usar webdriver-manager (tipico
 de una PC de escritorio Windows).
+
+------------------------------------------------------------------
+CAMBIOS EN ESTA VERSION (correccion del modo manual):
+------------------------------------------------------------------
+1) _worker_manual ahora revisa si "errores_local" quedo con contenido
+   despues de procesar_registro. Antes SIEMPRE mandaba tipo "listo" sin
+   importar si el IESS/CORESALUD habian fallado, por lo que un paciente
+   fallido se mostraba con estado "Listo" (✅) en vez de "Error" (❌), y
+   nunca aparecia el boton "Reintentar este paciente".
+
+2) La lectura de dependencias validas de la matriz (motor.abrir_matriz)
+   se cachea con @st.cache_data segun la ruta y la fecha de modificacion
+   del archivo. Antes se llamaba SIN cache al principio del tab manual,
+   que se re-ejecuta en CADA rerun de Streamlit (cada ~1.2s mientras hay
+   pacientes en cola); motor.abrir_matriz() hace un respaldo nuevo del
+   Instructivo Y lo imprime por stdout en cada llamada. Como el worker
+   en segundo plano usa contextlib.redirect_stdout (que reemplaza
+   sys.stdout a nivel de TODO el proceso, no solo del hilo), esos prints
+   del hilo principal se filtraban dentro del log de cada paciente,
+   generando el patron de "(Respaldo de la matriz guardado en: ...)"
+   repetido muchas veces y enterrando el mensaje de error real. Con el
+   cache, motor.abrir_matriz() solo se llama la primera vez (o cuando el
+   archivo de la matriz cambia), eliminando ese ruido.
+------------------------------------------------------------------
 """
 
 import os
@@ -377,7 +401,15 @@ def _worker_manual(q_in, q_out, carpeta_descargas_temp, carpeta_diagnostico):
     """Corre en un hilo aparte, uno por sesion de usuario. Mantiene UN
     solo Chrome abierto (igual que modo_interactivo en consola) y va
     tomando pacientes de la cola en el orden en que llegan, sin que la
-    interfaz tenga que esperar a que termine cada uno."""
+    interfaz tenga que esperar a que termine cada uno.
+
+    IMPORTANTE (correccion): al terminar de procesar un paciente, ahora
+    se revisa si "errores_local" quedo con contenido (el motor agrega
+    ahi cualquier fallo real de coberturasalud.msp.gob.ec o de
+    app.iess.gob.ec, incluso cuando el paciente en si se pudo procesar
+    sin excepcion). Si hay errores, se reporta como tipo "error" (para
+    que la UI marque el paciente como ❌ y ofrezca reintentarlo); si no
+    hay ninguno, se reporta como "listo" (✅), igual que antes."""
     driver_holder = [None]
     while True:
         item = q_in.get()
@@ -435,13 +467,28 @@ def _worker_manual(q_in, q_out, carpeta_descargas_temp, carpeta_diagnostico):
                             item["fecha_atencion"].strftime("%d-%m-%Y"), f"(MATRIZ) {e}"
                         ])
 
-            q_out.put(("listo", item_id, {
-                "nombre": reg.get("nombre"),
-                "log": log_buffer.getvalue(),
-                "filas_matriz": filas_escritas,
-                "errores": errores_local,
-                "sin_seguro": sin_seguro_local,
-            }))
+            if errores_local:
+                # Hubo al menos un fallo real (coberturasalud, IESS, o al
+                # escribir en la matriz): se reporta como error para que
+                # la UI ofrezca "Reintentar este paciente", en vez de
+                # marcarlo como Listo sin haberlo logrado.
+                detalle = "\n".join(
+                    f"{fila[0]} | {fila[1]} | {fila[2]} -> {fila[3]}" for fila in errores_local
+                )
+                q_out.put(("error", item_id, {
+                    "detalle": detalle,
+                    "log": log_buffer.getvalue(),
+                    "filas_matriz": filas_escritas,
+                    "sin_seguro": sin_seguro_local,
+                }))
+            else:
+                q_out.put(("listo", item_id, {
+                    "nombre": reg.get("nombre"),
+                    "log": log_buffer.getvalue(),
+                    "filas_matriz": filas_escritas,
+                    "errores": errores_local,
+                    "sin_seguro": sin_seguro_local,
+                }))
         except Exception as e:
             try:
                 driver_holder[0].quit()
@@ -523,6 +570,25 @@ def _lanzar_auto(items, escribir_matriz, responsable_matriz, es_reintento=False)
     )
     st.session_state.auto_thread = t
     t.start()
+
+
+@st.cache_data(show_spinner=False)
+def _cargar_dependencias_validas_cache(ruta_matriz, mtime):
+    """Envuelve motor.abrir_matriz()+obtener_dependencias_validas() en
+    cache de Streamlit, indexado por ruta y fecha de modificacion del
+    archivo. Sin esto, el tab manual llamaba a motor.abrir_matriz() en
+    CADA rerun de Streamlit (cada ~1.2s mientras hay pacientes en cola o
+    procesandose), y esa funcion hace un respaldo nuevo del Instructivo
+    y lo imprime por stdout en cada llamada -eso, sumado a que el hilo
+    en segundo plano usa contextlib.redirect_stdout (que reemplaza
+    sys.stdout para TODO el proceso, no solo para su propio hilo), hacia
+    que esos prints del hilo principal se filtraran dentro del log de
+    cada paciente, generando decenas de lineas repetidas de "(Respaldo
+    de la matriz guardado en: ...)" y enterrando el mensaje de error
+    real de coberturasalud/IESS. Con este cache, abrir_matriz() solo se
+    ejecuta la primera vez o cuando el archivo de la matriz cambia
+    (detectado por su mtime)."""
+    return motor.obtener_dependencias_validas(motor.abrir_matriz(ruta_matriz))
 
 
 _init_estado()
@@ -730,12 +796,16 @@ with tab_manual:
     st.subheader("Un paciente a la vez")
 
     # ---- Matriz: dependencias validas (si el Instructivo esta disponible) ----
+    # NOTA: se usa la version con cache (_cargar_dependencias_validas_cache)
+    # para no reabrir y respaldar el archivo de la matriz en cada rerun de
+    # Streamlit (ver comentario de esa funcion mas arriba).
     dependencias_validas = []
     hay_matriz_disponible = False
     aviso_matriz = None
     try:
         ruta_matriz_actual = motor.localizar_archivo_matriz()
-        dependencias_validas = motor.obtener_dependencias_validas(motor.abrir_matriz(ruta_matriz_actual))
+        mtime_matriz_actual = os.path.getmtime(ruta_matriz_actual)
+        dependencias_validas = _cargar_dependencias_validas_cache(ruta_matriz_actual, mtime_matriz_actual)
         hay_matriz_disponible = True
     except FileNotFoundError as e:
         aviso_matriz = str(e)
@@ -893,6 +963,9 @@ with tab_manual:
                 elif tipo == "error":
                     it["estado"] = "Error"
                     it["detalle"] = datos.get("detalle", "")
+                    it["filas_matriz"] = datos.get("filas_matriz", [])
+                    if datos.get("sin_seguro"):
+                        st.session_state.manual_sin_seguro.extend(datos.get("sin_seguro", []))
                 break
     except queue.Empty:
         pass
