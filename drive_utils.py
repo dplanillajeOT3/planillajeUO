@@ -81,17 +81,48 @@ def obtener_servicio_drive(secrets_gcp):
 # ============================================================
 
 
+def listar_unidades_compartidas_visibles(servicio):
+    """Todas las Unidades Compartidas (Shared Drives) que esta cuenta de
+    servicio puede ver ahora mismo, sin filtrar por nombre. Util para
+    diagnosticar: si esta lista sale vacia, el problema es de permisos
+    (no se comparti\u00f3 la Unidad Compartida en si con el correo de la
+    cuenta de servicio, o solo se comparti\u00f3 una carpeta de adentro)."""
+    vistas = []
+    token = None
+    while True:
+        resultado = servicio.drives().list(
+            pageSize=100, pageToken=token, fields="nextPageToken, drives(id, name)"
+        ).execute()
+        vistas += resultado.get("drives", [])
+        token = resultado.get("nextPageToken")
+        if not token:
+            break
+    return vistas
+
+
 def id_unidad_compartida(servicio, nombre=NOMBRE_UNIDAD_COMPARTIDA):
-    resultado = servicio.drives().list(
-        q=f"name = '{nombre}'", fields="drives(id, name)"
-    ).execute()
-    drives = resultado.get("drives", [])
-    if not drives:
+    visibles = listar_unidades_compartidas_visibles(servicio)
+
+    objetivo = nombre.strip().casefold()
+    for unidad in visibles:
+        if unidad["name"].strip().casefold() == objetivo:
+            return unidad["id"]
+
+    if not visibles:
         raise FileNotFoundError(
-            f"No se encontro ninguna Unidad Compartida llamada '{nombre}' visible "
-            "para esta cuenta de servicio. Revisa que este compartida con su correo."
+            f"Esta cuenta de servicio no ve NINGUNA Unidad Compartida (0 resultados). "
+            f"Seguramente se compartio una carpeta de ADENTRO de '{nombre}' con su correo, "
+            "en vez de compartir la Unidad Compartida completa. Hay que compartir la Unidad "
+            "Compartida en si (clic derecho sobre su nombre en la barra lateral de Drive -> "
+            "'Administrar miembros' / 'Compartir') como Administrador de contenido."
         )
-    return drives[0]["id"]
+
+    nombres_vistos = ", ".join(f"'{u['name']}'" for u in visibles)
+    raise FileNotFoundError(
+        f"Esta cuenta de servicio SI ve Unidades Compartidas, pero ninguna se llama "
+        f"exactamente '{nombre}'. Las que ve son: {nombres_vistos}. "
+        "Revisa mayusculas/espacios, o ajusta NOMBRE_UNIDAD_COMPARTIDA en drive_utils.py."
+    )
 
 
 def buscar_subcarpeta(servicio, drive_id, id_padre, nombre_exacto):
