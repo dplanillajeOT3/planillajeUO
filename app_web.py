@@ -135,11 +135,11 @@ def _servicio_drive():
 
 
 def _carpeta_mes_actual(servicio, fecha=None):
-    drive_id = drv.id_unidad_compartida(servicio)
+    id_raiz = drv.id_carpeta_raiz(servicio)
     nombre_unidad = st.session_state.unidad["nombre"]
-    id_carpeta_mes = drv.carpeta_de_unidad_anio_mes(servicio, drive_id, nombre_unidad, fecha or date.today())
-    ids_tipo = drv.asegurar_subcarpetas_tipo_seguro(servicio, drive_id, id_carpeta_mes)
-    return drive_id, id_carpeta_mes, ids_tipo
+    id_carpeta_mes = drv.carpeta_de_unidad_anio_mes(servicio, id_raiz, nombre_unidad, fecha or date.today())
+    ids_tipo = drv.asegurar_subcarpetas_tipo_seguro(servicio, id_carpeta_mes)
+    return id_carpeta_mes, ids_tipo
 
 
 def _asegurar_matriz_desde_drive():
@@ -154,8 +154,8 @@ def _asegurar_matriz_desde_drive():
         return False
 
     try:
-        drive_id, id_carpeta_mes, _ = _carpeta_mes_actual(servicio)
-        archivo = drv.buscar_archivo_por_patron(servicio, drive_id, id_carpeta_mes, r"^INSTRUCTIVO.*\.xlsx$")
+        id_carpeta_mes, _ = _carpeta_mes_actual(servicio)
+        archivo = drv.buscar_archivo_por_patron(servicio, id_carpeta_mes, r"^INSTRUCTIVO.*\.xlsx$")
         if archivo is not None:
             destino = os.path.join(core.BASE_DIR, archivo["name"])
             drv.descargar_archivo(servicio, archivo["id"], destino)
@@ -176,7 +176,7 @@ def _asegurar_matriz_desde_drive():
         with open(destino, "wb") as f:
             f.write(plantilla.getbuffer())
         try:
-            drive_id, id_carpeta_mes, _ = _carpeta_mes_actual(servicio)
+            id_carpeta_mes, _ = _carpeta_mes_actual(servicio)
             drv.subir_o_reemplazar_archivo(servicio, destino, plantilla.name, id_carpeta_mes, drv.MIME_XLSX)
             st.success("Plantilla guardada y subida a Drive.")
         except Exception as e:
@@ -194,7 +194,7 @@ def _sincronizar_con_drive():
 
     with st.spinner("Sincronizando con Drive..."):
         try:
-            drive_id, id_carpeta_mes, ids_tipo = _carpeta_mes_actual(servicio)
+            id_carpeta_mes, ids_tipo = _carpeta_mes_actual(servicio)
         except Exception as e:
             st.error(f"No se pudo ubicar la carpeta en Drive: {e}")
             return
