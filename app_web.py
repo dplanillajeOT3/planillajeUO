@@ -433,10 +433,12 @@ with tab_manual:
         cedula = st.text_input("Cédula (*):", key="campo_cedula")
     with col2:
         fecha_atencion = st.date_input(
-            "Fecha de atención (*):", value=datetime.now(), format="DD/MM/YYYY", key="campo_fecha_atencion"
+            "Fecha de atención (*):", value=datetime.now(), format="DD/MM/YYYY",
+            min_value=date(2015, 1, 1), max_value=date.today(), key="campo_fecha_atencion",
         )
         fecha_nacimiento = st.date_input(
-            "Fecha de nacimiento (*):", value=None, format="DD/MM/YYYY", key="campo_fecha_nac"
+            "Fecha de nacimiento (*):", value=None, format="DD/MM/YYYY",
+            min_value=date(1900, 1, 1), max_value=date.today(), key="campo_fecha_nac",
         )
     with col3:
         dependencia = st.selectbox("Dependencia:", dependencias_validas, key="campo_dependencia")
@@ -446,7 +448,7 @@ with tab_manual:
 
     log_manual = st.empty()
 
-    if st.button("➕ Procesar y agregar a la matriz", type="primary"):
+    if st.button("➕ Procesar y seguir con el siguiente", type="primary"):
         if not cedula or fecha_nacimiento is None:
             st.error("Completa Cédula y Fecha de nacimiento.")
         else:
