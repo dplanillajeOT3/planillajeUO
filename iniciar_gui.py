@@ -21,14 +21,16 @@ Tiene dos formas de trabajar:
 """
 
 import io
+import re
 import sys
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 import os
 
 import descargar_coberturas as core
+import sync_drive
 
 
 def _ocultar_consola():
@@ -337,8 +339,32 @@ class VentanaPrincipal:
 
         self.cola = queue.Queue()
         self.filas_por_indice = {}
+        self.registros = {}
         self.corriendo = False
         self.ventana_manual = None
+
+        self.errores = []
+        self.sin_seguro = []
+
+        # Configuracion de "tambien agregar a la matriz" para el modo por
+        # lotes: se pregunta UNA sola vez por sesion (ver
+        # _preguntar_config_matriz_lote) y se reutiliza tanto en la
+        # corrida completa como en cada "Reintentar fallidos". Cada
+        # paciente se agrega a la matriz DEL MES QUE LE CORRESPONDA
+        # segun su propia fecha de atencion, no siempre la del mes
+        # actual.
+        self._config_matriz_preguntada = False
+        self.generar_matriz_lote = False
+        self.responsable_lote = None
+
+        # Google Drive: se configura la primera vez y, si en este PC no hay
+        # matriz del mes actual, se baja de Drive. Si algo falla, el
+        # programa sigue funcionando solo con las carpetas locales.
+        try:
+            sync_drive.configurar_primera_vez(self.root)
+            sync_drive.traer_matriz_si_falta(print)
+        except Exception as e:
+            print(f"[Drive] {e}")
 
         self._armar_interfaz()
         self._cargar_pacientes_iniciales()
@@ -362,6 +388,11 @@ class VentanaPrincipal:
             barra_superior, text="Ingresar paciente manual", command=self._abrir_ventana_manual
         )
         self.boton_manual.pack(side="left", padx=(8, 0))
+
+        self.boton_reintentar_lote = ttk.Button(
+            barra_superior, text="Reintentar fallidos", command=self._reintentar_fallidos_lote
+        )
+        self.boton_reintentar_lote.pack(side="left", padx=(8, 0))
 
         self.boton_abrir_carpeta = ttk.Button(
             barra_superior, text="Abrir carpeta de resultados", command=self._abrir_carpeta, state="disabled"
@@ -436,6 +467,7 @@ class VentanaPrincipal:
                 values=(i, reg["nombre"], reg["cedula"], fechas_txt, "Pendiente")
             )
             self.filas_por_indice[i] = item_id
+            self.registros[i] = reg
 
         self.etiqueta_progreso.configure(text=f"0 / {self.total} pacientes")
 
@@ -443,22 +475,133 @@ class VentanaPrincipal:
     def _iniciar(self):
         if self.corriendo:
             return
+        if not self._config_matriz_preguntada:
+            self._preguntar_config_matriz_lote()
+            self._config_matriz_preguntada = True
+
         self.corriendo = True
         self.boton_iniciar.configure(state="disabled")
         self.boton_manual.configure(state="disabled")
+        self.boton_reintentar_lote.configure(state="disabled")
         self._agregar_log("Iniciando... se abrira Chrome en segundo plano.\n")
 
-        hilo = threading.Thread(target=self._correr_descarga, daemon=True)
+        items = list(self.registros.items())
+        self.barra_progreso.configure(maximum=max(len(items), 1), value=0)
+        hilo = threading.Thread(target=self._correr_descarga, args=(items,), daemon=True)
         hilo.start()
 
-    def _correr_descarga(self):
+    def _preguntar_config_matriz_lote(self):
+        """Se pregunta UNA sola vez por sesion, al iniciar el primer
+        lote: si se quiere que estos pacientes tambien se agreguen a la
+        matriz de Excel (ademas de descargar los PDF). Cada paciente se
+        agrega a la matriz DEL MES QUE LE CORRESPONDA segun su propia
+        fecha de atencion (no siempre la del mes actual). Dependencia,
+        fecha de nacimiento y sexo quedan EN BLANCO en cada fila -el
+        modo por lotes no trae esos datos, se completan despues a mano-;
+        solo se pide el Responsable, que se usa en todas las filas del
+        lote (y de sus reintentos)."""
+        quiere_matriz = messagebox.askyesno(
+            "Matriz de Excel",
+            "¿Quieres que estos pacientes tambien se agreguen a la matriz de Excel, "
+            "ademas de descargar los PDF?\n\n"
+            "OJO: Dependencia, fecha de nacimiento y sexo quedaran EN BLANCO en cada "
+            "fila (se completan despues a mano); solo se llenan institucion, cedula, "
+            "nombre, fecha de atencion, parentesco/afiliado y Responsable. Cada "
+            "paciente se agrega a la matriz del mes que le corresponda segun su "
+            "fecha de atencion."
+        )
+        if not quiere_matriz:
+            self.generar_matriz_lote = False
+            self.responsable_lote = None
+            return
+
+        responsable = None
+        while not responsable:
+            respuesta = simpledialog.askstring(
+                "Responsable", "¿Quien es el responsable que ingresa esta informacion?", parent=self.root
+            )
+            if respuesta is None:  # se cancelo el dialogo
+                self.generar_matriz_lote = False
+                self.responsable_lote = None
+                return
+            responsable = respuesta.strip().upper()
+
+        try:
+            core.localizar_archivo_matriz()  # solo para validar que exista una matriz base
+            self.generar_matriz_lote = True
+            self.responsable_lote = responsable
+            self._agregar_log(
+                f"Se agregara cada paciente a la matriz de su mes correspondiente "
+                f"(Responsable: {responsable})\n"
+            )
+        except FileNotFoundError as e:
+            messagebox.showwarning("Matriz no encontrada", str(e))
+            self.generar_matriz_lote = False
+            self.responsable_lote = None
+
+    def _reintentar_fallidos_lote(self):
+        if self.corriendo:
+            return
+
+        pendientes = [
+            i for i, item_id in self.filas_por_indice.items()
+            if self.tabla.set(item_id, "estado") == "Con errores"
+        ]
+        if not pendientes:
+            messagebox.showinfo("Reintentar fallidos", "No hay ninguna fila en 'Con errores' para reintentar.")
+            return
+
+        # Se limpian los errores/sin-seguro viejos de estos pacientes
+        # antes de reintentar, para que el reporte final no quede con
+        # entradas repetidas si ahora si funcionan.
+        cedulas_a_reintentar = {self.registros[i]["cedula"] for i in pendientes}
+        self.errores = [e for e in self.errores if e[1] not in cedulas_a_reintentar]
+        self.sin_seguro = [s for s in self.sin_seguro if s[1] not in cedulas_a_reintentar]
+
+        for i in pendientes:
+            item_id = self.filas_por_indice[i]
+            valores = list(self.tabla.item(item_id, "values"))
+            valores[4] = "Pendiente"
+            self.tabla.item(item_id, values=valores, tags=())
+
+        items = [(i, self.registros[i]) for i in pendientes]
+        self.barra_progreso.configure(maximum=max(len(items), 1), value=0)
+
+        self.corriendo = True
+        self.boton_iniciar.configure(state="disabled")
+        self.boton_manual.configure(state="disabled")
+        self.boton_reintentar_lote.configure(state="disabled")
+        self._agregar_log(f"Reintentando {len(items)} paciente(s) fallido(s)...\n")
+
+        hilo = threading.Thread(target=self._correr_descarga, args=(items,), daemon=True)
+        hilo.start()
+
+    def _correr_descarga(self, items):
         salida_original = sys.stdout
         sys.stdout = ColaComoArchivo(self.cola)
         try:
-            core.main(
-                callback_fila=lambda i, estado: self.cola.put(("fila", i, estado)),
-                callback_progreso=lambda hechos, total: self.cola.put(("progreso", hechos, total)),
-            )
+            os.makedirs(core.CARPETA_SALIDA, exist_ok=True)
+            carpeta_temp = os.path.join(core.CARPETA_SALIDA, "_descargas_temp")
+            os.makedirs(carpeta_temp, exist_ok=True)
+            carpeta_diagnostico = os.path.join(core.CARPETA_SALIDA, "_diagnostico")
+
+            driver_holder = [core.crear_driver(carpeta_temp)]
+            try:
+                core.procesar_lote(
+                    items, driver_holder, carpeta_temp, carpeta_diagnostico,
+                    self.errores, self.sin_seguro,
+                    callback_fila=lambda i, estado: self.cola.put(("fila", i, estado)),
+                    callback_progreso=lambda hechos, total: self.cola.put(("progreso", hechos, total)),
+                    escribir_matriz=self.generar_matriz_lote, responsable_matriz=self.responsable_lote
+                )
+            finally:
+                try:
+                    driver_holder[0].quit()
+                except Exception:
+                    pass
+
+            core._guardar_reportes_finales(self.errores, self.sin_seguro)
+            sync_drive.sincronizar(print)   # sube PDF y matriz a Drive
             self.cola.put(("fin_ok", None))
         except Exception as e:
             self.cola.put(("fin_error", str(e)))
@@ -498,14 +641,16 @@ class VentanaPrincipal:
                     self.corriendo = False
                     self.boton_iniciar.configure(state="normal")
                     self.boton_manual.configure(state="normal")
+                    self.boton_reintentar_lote.configure(state="normal")
                     self.boton_abrir_carpeta.configure(state="normal")
-                    self.etiqueta_progreso.configure(text=f"Terminado - {self.total} / {self.total} pacientes")
+                    self.etiqueta_progreso.configure(text="Terminado")
                     messagebox.showinfo("Listo", "La descarga termino. Revisa la carpeta de resultados.")
 
                 elif tipo == "fin_error":
                     self.corriendo = False
                     self.boton_iniciar.configure(state="normal")
                     self.boton_manual.configure(state="normal")
+                    self.boton_reintentar_lote.configure(state="normal")
                     messagebox.showerror("Error inesperado", item[1])
 
         except queue.Empty:
@@ -601,6 +746,7 @@ class VentanaManual(tk.Toplevel):
         self.var_cedula = tk.StringVar()
         self.entry_cedula = ttk.Entry(cont, textvariable=self.var_cedula, width=22)
         self.entry_cedula.grid(row=fila, column=1, sticky="w", pady=4)
+        self.entry_cedula.bind("<FocusOut>", self._autocompletar_desde_cedula)
         fila += 1
 
         ttk.Label(cont, text="Fecha de atencion:").grid(row=fila, column=0, sticky="w", pady=4)
@@ -819,9 +965,39 @@ class VentanaManual(tk.Toplevel):
         self.var_cedula.set("")
         self.var_fecha_nacimiento.set("")
         self.var_sexo.set("")
+        self.var_dependencia.set("")
         self.var_observaciones.set("")
         self.var_fecha_atencion.set(core.date.today().strftime("%d-%m-%Y"))
         self.entry_cedula.focus_set()
+
+    # ---------------------------------------------------------------
+    def _autocompletar_desde_cedula(self, evento=None):
+        """Cuando se sale del campo Cedula, si ya se habia ingresado
+        antes esta misma cedula, se rellenan solos la fecha de
+        nacimiento y el sexo (que no cambian de una visita a otra), para
+        no tener que volver a escribirlos. Dependencia y observaciones
+        NO se autocompletan porque esas si cambian visita a visita.
+        Si el campo ya tiene algo escrito, no se pisa."""
+        cedula = re.sub(r"\D", "", self.var_cedula.get())
+        if len(cedula) != 10:
+            return
+        datos = core.obtener_datos_guardados_paciente(cedula)
+        if not datos:
+            return
+
+        relleno = []
+        if datos.get("fecha_nacimiento") and not self.var_fecha_nacimiento.get().strip():
+            self.var_fecha_nacimiento.set(datos["fecha_nacimiento"])
+            relleno.append(f"fecha de nacimiento {datos['fecha_nacimiento']}")
+        if datos.get("sexo") and not self.var_sexo.get().strip():
+            self.var_sexo.set("Masculino" if datos["sexo"] == "M" else "Femenino")
+            relleno.append(f"sexo {datos['sexo']}")
+
+        if relleno:
+            nombre_txt = f" ({datos['nombre']})" if datos.get("nombre") else ""
+            self._agregar_log(
+                f"   (Cedula {cedula}{nombre_txt} ya ingresada antes: se autocompleto {', '.join(relleno)})\n"
+            )
 
     # ---------------------------------------------------------------
     def _reencolar(self, num):
@@ -905,6 +1081,16 @@ class VentanaManual(tk.Toplevel):
                     self.errores, self.sin_seguro, recolectar_matriz=True
                 )
 
+                # Se recuerdan estos datos para la proxima vez que se
+                # ingrese la misma cedula (fecha de nacimiento y sexo no
+                # cambian de una visita a otra, asi no hay que volver a
+                # escribirlos). El nombre se guarda si ya se pudo
+                # detectar desde el PDF.
+                core.guardar_datos_paciente(
+                    datos["cedula"], nombre=reg.get("nombre"),
+                    fecha_nacimiento=datos["fecha_nacimiento"], sexo=datos["sexo_codigo"]
+                )
+
                 # Se distingue el resultado DEL PACIENTE PRINCIPAL (no de
                 # un familiar) para decidir el estado: un error suyo
                 # propio no lleva el prefijo "(ROL)" que si llevan los
@@ -922,7 +1108,7 @@ class VentanaManual(tk.Toplevel):
                 if self.ruta_matriz is not None and filas_matriz:
                     try:
                         filas_escritas = core.agregar_filas_matriz_con_bloqueo(
-                            self.ruta_matriz, filas_matriz, datos["dependencia"], datos["fecha_nacimiento"],
+                            filas_matriz, datos["dependencia"], datos["fecha_nacimiento"],
                             datos["sexo_codigo"], datos["observaciones"], datos["responsable"]
                         )
                     except TimeoutError as e:
@@ -934,8 +1120,9 @@ class VentanaManual(tk.Toplevel):
                         ])
                     else:
                         self.filas_agregadas += len(filas_escritas)
-                        for fila_escrita in filas_escritas:
-                            print(f"   -> Fila {fila_escrita} agregada a la matriz ({core.HOJA_MATRIZ}).")
+                        for ruta_matriz_fila, fila_escrita in filas_escritas:
+                            print(f"   -> Fila {fila_escrita} agregada a la matriz "
+                                  f"({os.path.basename(ruta_matriz_fila)}).")
                         agregado = True
 
                 if agregado:
@@ -959,6 +1146,7 @@ class VentanaManual(tk.Toplevel):
                     estado = "Error"
 
                 self.cola.put(("estado", datos["_num"], estado))
+                sync_drive.sincronizar(print)   # sube lo de este paciente a Drive
 
             except Exception as e:
                 self.cola.put(("log", f"ERROR procesando paciente #{datos['_num']}: {e}\n"))
