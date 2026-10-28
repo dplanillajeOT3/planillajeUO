@@ -20,7 +20,7 @@ REQUISITOS (junto a este archivo, descargar_coberturas.py y drive_utils.py):
       chromium-driver
 
   requirements.txt:
-      streamlit>=1.31
+      streamlit>=1.33
       selenium
       webdriver-manager
       openpyxl
@@ -447,9 +447,69 @@ with tab_lotes:
             _correr_lote(st.session_state.fallidos_lote, "📦 Descargar resultado del reintento (.zip)")
 
 # ------------------------------------------------------------
-# PESTAÑA 2: MANUAL
+# PESTAÑA 2: MANUAL (cola de pacientes)
 # ------------------------------------------------------------
+def _pdfs_en_salida():
+    """Conjunto de PDFs que hay ahora en la carpeta de salida del servidor
+    (sirve para saber cuales se descargaron en cada corrida)."""
+    encontrados = set()
+    if os.path.isdir(core.CARPETA_SALIDA):
+        for raiz, _, archivos in os.walk(core.CARPETA_SALIDA):
+            if os.path.basename(raiz) in ("_descargas_temp", "_diagnostico"):
+                continue
+            for a in archivos:
+                if a.lower().endswith(".pdf"):
+                    encontrados.add(os.path.join(raiz, a))
+    return encontrados
+
+
+def _agregar_a_cola():
+    """Callback del boton: valida, agrega el paciente a la cola y deja el
+    formulario en blanco (solo se conserva el Responsable; la fecha de
+    atencion vuelve a 'hoy'). Al ser un callback, corre ANTES de dibujar
+    el formulario, por eso los campos se ven vacios de inmediato."""
+    ss = st.session_state
+    cedula = (ss.get("campo_cedula") or "").strip()
+
+    faltan = []
+    if not cedula:
+        faltan.append("Cédula")
+    if ss.get("campo_fecha_nac") is None:
+        faltan.append("Fecha de nacimiento")
+    if ss.get("campo_dependencia") is None:
+        faltan.append("Dependencia")
+    if ss.get("campo_sexo") is None:
+        faltan.append("Sexo")
+    if faltan:
+        ss.aviso_form = ("error", "Falta completar: " + ", ".join(faltan) + ".")
+        return
+
+    fecha_atencion = ss.get("campo_fecha_atencion") or date.today()
+    ss.cola_manual.append({
+        "reg": {
+            "cedula": cedula.zfill(10), "nombre": None, "fechas": [fecha_atencion],
+            "cedula_padre": None, "cedula_titular": None,
+        },
+        "datos": {
+            "dependencia": ss.campo_dependencia, "fecha_nacimiento": ss.campo_fecha_nac,
+            "sexo": ss.campo_sexo, "observaciones": ss.get("campo_observaciones", ""),
+            "responsable": ss.get("campo_responsable", ""),
+        },
+        "estado": "Pendiente",
+    })
+    ss.aviso_form = ("ok", f"Cédula {cedula} agregada a la cola ({len(ss.cola_manual)} en total).")
+
+    ss.campo_cedula = ""
+    ss.campo_fecha_nac = None
+    ss.campo_dependencia = None
+    ss.campo_sexo = None
+    ss.campo_observaciones = ""
+    ss.campo_fecha_atencion = date.today()
+
+
 with tab_manual:
+    st.session_state.setdefault("cola_manual", [])
+
     try:
         dependencias_validas = core.obtener_dependencias_validas(
             core.abrir_matriz(core.localizar_archivo_matriz())
@@ -459,71 +519,104 @@ with tab_manual:
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        responsable = st.text_input("Responsable:", key="campo_responsable")
-        cedula = st.text_input("Cédula (*):", key="campo_cedula")
+        st.text_input("Responsable:", key="campo_responsable")
+        st.text_input("Cédula (*):", key="campo_cedula")
     with col2:
-        fecha_atencion = st.date_input(
-            "Fecha de atención (*):", value=datetime.now(), format="DD/MM/YYYY",
+        st.date_input(
+            "Fecha de atención (*):", value=date.today(), format="DD/MM/YYYY",
             min_value=date(2015, 1, 1), max_value=date.today(), key="campo_fecha_atencion",
         )
-        fecha_nacimiento = st.date_input(
+        st.date_input(
             "Fecha de nacimiento (*):", value=None, format="DD/MM/YYYY",
             min_value=date(1900, 1, 1), max_value=date.today(), key="campo_fecha_nac",
         )
     with col3:
-        dependencia = st.selectbox("Dependencia:", dependencias_validas, key="campo_dependencia")
-        sexo = st.radio("Sexo (*):", ["M", "F"], horizontal=True, key="campo_sexo")
+        st.selectbox(
+            "Dependencia (*):", dependencias_validas, index=None,
+            placeholder="Seleccione...", key="campo_dependencia",
+        )
+        st.radio("Sexo (*):", ["M", "F"], index=None, horizontal=True, key="campo_sexo")
 
-    observaciones = st.text_input("Observaciones:", key="campo_observaciones")
+    st.text_input("Observaciones:", key="campo_observaciones")
 
-    log_manual = st.empty()
+    st.button("➕ Agregar a la cola y seguir con el siguiente", type="primary", on_click=_agregar_a_cola)
 
-    if st.button("➕ Procesar y seguir con el siguiente", type="primary"):
-        if not cedula or fecha_nacimiento is None:
-            st.error("Completa Cédula y Fecha de nacimiento.")
-        else:
-            reg = {
-                "cedula": cedula.strip().zfill(10), "nombre": None,
-                "fechas": [fecha_atencion], "cedula_padre": None, "cedula_titular": None,
-            }
-            datos_matriz = {
-                "dependencia": dependencia, "fecha_nacimiento": fecha_nacimiento,
-                "sexo": sexo, "observaciones": observaciones, "responsable": responsable,
-            }
+    aviso = st.session_state.pop("aviso_form", None)
+    if aviso:
+        (st.success if aviso[0] == "ok" else st.error)(aviso[1])
+
+    # ---------------- Cola y procesamiento ----------------
+    cola = st.session_state.cola_manual
+    if cola:
+        st.divider()
+        por_procesar = [it for it in cola if not it["estado"].startswith("OK")]
+        st.write(f"**Cola: {len(cola)} paciente(s)** — {len(por_procesar)} por procesar "
+                 f"(pendientes o con error), {len(cola) - len(por_procesar)} listos")
+
+        tabla = st.empty()
+
+        def _pintar_tabla():
+            tabla.dataframe(
+                [{"Cédula": it["reg"]["cedula"],
+                  "Fecha atención": it["reg"]["fechas"][0].strftime("%d/%m/%Y"),
+                  "Dependencia": it["datos"]["dependencia"],
+                  "Estado": it["estado"]} for it in cola],
+                use_container_width=True, height=min(60 + 35 * len(cola), 300),
+            )
+
+        _pintar_tabla()
+
+        auto_drive = st.checkbox(
+            "☁️ Subir a Drive automáticamente al terminar", value=True, key="auto_drive_manual"
+        )
+        barra = st.empty()
+        log_manual = st.empty()
+        if st.session_state.get("log_manual_ultimo"):
+            log_manual.code(st.session_state.log_manual_ultimo[-4000:], language="bash")
+
+        if por_procesar and st.button(f"🚀 Procesar cola ({len(por_procesar)})", type="primary"):
+            antes = _pdfs_en_salida()
+            os.makedirs(core.CARPETA_SALIDA, exist_ok=True)
+            carpeta_descargas_temp = os.path.join(core.CARPETA_SALIDA, "_descargas_temp")
+            os.makedirs(carpeta_descargas_temp, exist_ok=True)
+            carpeta_diagnostico = os.path.join(core.CARPETA_SALIDA, "_diagnostico")
 
             with log_en_vivo(log_manual, "log_buffer_manual"):
-                os.makedirs(core.CARPETA_SALIDA, exist_ok=True)
-                carpeta_descargas_temp = os.path.join(core.CARPETA_SALIDA, "_descargas_temp")
-                os.makedirs(carpeta_descargas_temp, exist_ok=True)
-                carpeta_diagnostico = os.path.join(core.CARPETA_SALIDA, "_diagnostico")
                 driver_holder = _obtener_driver(carpeta_descargas_temp)
+                total = len(por_procesar)
+                for n, it in enumerate(por_procesar, start=1):
+                    cedula_actual = it["reg"]["cedula"]
+                    barra.progress((n - 1) / total, text=f"⏳ Descargando {n}/{total}: cédula {cedula_actual}...")
+                    it["estado"] = "Procesando..."
+                    _pintar_tabla()
+                    try:
+                        it["estado"] = _procesar_un_registro(
+                            driver_holder, carpeta_descargas_temp, carpeta_diagnostico,
+                            it["reg"], it["datos"],
+                        )
+                    except Exception as e:
+                        it["estado"] = f"ERROR: {type(e).__name__}: {str(e)[:150]}"
+                    _pintar_tabla()
+                barra.progress(1.0, text=f"✅ Terminado: {total} paciente(s) procesado(s)")
 
-                estado = _procesar_un_registro(
-                    driver_holder, carpeta_descargas_temp, carpeta_diagnostico, reg, datos_matriz
-                )
+            st.session_state.log_manual_ultimo = st.session_state.get("log_buffer_manual", "")
+            nuevos = sorted(_pdfs_en_salida() - antes)
+            st.session_state.ultimos_pdfs = [os.path.relpath(p, core.CARPETA_SALIDA) for p in nuevos]
 
-            fila_historial = {
-                "Cédula": reg["cedula"], "Fecha": fecha_atencion.strftime("%d/%m/%Y"), "Estado": estado,
-            }
-            if estado.startswith("ERROR") or estado == "SIN SEGURO":
-                fila_historial["_reg"] = reg
-                fila_historial["_datos"] = datos_matriz
-            st.session_state.historial_manual.append(fila_historial)
+            if nuevos:
+                st.success(f"Se descargaron {len(nuevos)} PDF(s) en esta corrida.")
+            else:
+                st.warning("No se descargó ningún PDF nuevo en esta corrida. Revisa el Estado de cada "
+                           "paciente en la tabla y el detalle en el recuadro de arriba.")
+            if auto_drive and (nuevos or any(it["estado"].startswith("OK") for it in cola)):
+                _sincronizar_con_drive()
 
-            for k in ("campo_cedula", "campo_fecha_nac", "campo_sexo", "campo_observaciones", "campo_dependencia"):
-                st.session_state.pop(k, None)
-            st.rerun()
-
-    if st.session_state.historial_manual:
-        st.divider()
-        fallidos = [h for h in st.session_state.historial_manual if "_reg" in h]
-        st.write(f"**{len(st.session_state.historial_manual)} procesado(s) en esta sesión** "
-                 f"({len(fallidos)} con error)")
-        st.dataframe(
-            [{"Cédula": h["Cédula"], "Fecha": h["Fecha"], "Estado": h["Estado"]}
-             for h in st.session_state.historial_manual],
-            use_container_width=True, height=200,
-        )
+        if st.session_state.get("ultimos_pdfs"):
+            with st.expander(f"📄 PDFs descargados en la última corrida ({len(st.session_state.ultimos_pdfs)})"):
+                st.caption("Se guardan primero en el servidor (carpeta PDF_DESCARGADOS) y, al sincronizar, "
+                           "se suben a Drive: PLANILLAJE COBERTURAS / tu unidad / año / mes / IESS o CAMPESINO.")
+                for ruta in st.session_state.ultimos_pdfs:
+                    st.write(f"• {ruta}")
 
         cA, cB, cC, cD = st.columns(4)
         with cA:
@@ -535,22 +628,8 @@ with tab_manual:
             if st.button("☁️ Sincronizar con Drive"):
                 _sincronizar_con_drive()
         with cC:
-            if fallidos and st.button(f"🔁 Reintentar los {len(fallidos)} fallidos"):
-                os.makedirs(core.CARPETA_SALIDA, exist_ok=True)
-                carpeta_descargas_temp = os.path.join(core.CARPETA_SALIDA, "_descargas_temp")
-                os.makedirs(carpeta_descargas_temp, exist_ok=True)
-                carpeta_diagnostico = os.path.join(core.CARPETA_SALIDA, "_diagnostico")
-                driver_holder = _obtener_driver(carpeta_descargas_temp)
-
-                with log_en_vivo(log_manual, "log_buffer_manual"):
-                    for h in fallidos:
-                        estado = _procesar_un_registro(
-                            driver_holder, carpeta_descargas_temp, carpeta_diagnostico, h["_reg"], h["_datos"]
-                        )
-                        h["Estado"] = estado
-                        if not (estado.startswith("ERROR") or estado == "SIN SEGURO"):
-                            h.pop("_reg", None)
-                            h.pop("_datos", None)
+            if st.button("🗑️ Quitar los listos (OK)"):
+                st.session_state.cola_manual = [it for it in cola if not it["estado"].startswith("OK")]
                 st.rerun()
         with cD:
             if st.button("🔴 Cerrar Chrome"):
