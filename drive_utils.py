@@ -17,8 +17,6 @@ Estructura esperada:
             INSTRUCTIVO5 SEPTIEMBRE 2026.xlsx
             IESS/
             CAMPESINO/
-            ISSFA/
-            ISSPOL/
 
 No se toca nada de descargar_coberturas.py: este modulo solo mueve
 archivos hacia/desde Drive. La logica real de descarga y de llenado de
@@ -39,7 +37,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from google.oauth2 import service_account
 
 NOMBRE_CARPETA_RAIZ = "PLANILLAJE COBERTURAS"
-CARPETAS_TIPO_SEGURO = ["IESS", "CAMPESINO", "ISSFA", "ISSPOL"]
+CARPETAS_TIPO_SEGURO = ["IESS", "CAMPESINO"]
 
 MIME_CARPETA = "application/vnd.google-apps.folder"
 MIME_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -198,7 +196,7 @@ def carpeta_de_unidad_anio_mes(servicio, id_raiz, nombre_unidad, fecha, crear_si
 
 
 def asegurar_subcarpetas_tipo_seguro(servicio, id_carpeta_mes):
-    """Devuelve {'IESS': id, 'CAMPESINO': id, 'ISSFA': id, 'ISSPOL': id},
+    """Devuelve {'IESS': id, 'CAMPESINO': id},
     creando las que falten."""
     return {nombre: buscar_o_crear_subcarpeta(servicio, id_carpeta_mes, nombre)
             for nombre in CARPETAS_TIPO_SEGURO}
@@ -249,24 +247,21 @@ def subir_o_reemplazar_archivo(servicio, ruta_local, nombre_archivo, id_carpeta,
 
 def _estado_fila(texto_sin_tildes, etiqueta, limite):
     patron = rf"\b{re.escape(etiqueta)}\b(?:(?!\b{re.escape(limite)}\b).)*?(SI REGISTRA COBERTURA|NO REGISTRA COBERTURA)"
-    m = re.search(patron, texto_sin_tildes, re.DOTALL)
-    if not m:
+    # La etiqueta tambien sale en el encabezado de la tabla ("IESS, ISSFA,
+    # ISSPOL"); la fila real es siempre la ULTIMA coincidencia.
+    coincidencias = list(re.finditer(patron, texto_sin_tildes, re.DOTALL))
+    if not coincidencias:
         return None
-    return m.group(1) == "SI REGISTRA COBERTURA"
+    return coincidencias[-1].group(1) == "SI REGISTRA COBERTURA"
 
 
 def determinar_esquema_cobertura(texto_pdf, es_campesino_fn):
-    """Devuelve 'ISSFA', 'ISSPOL', 'CAMPESINO' o 'IESS' segun cual fila de
-    la tabla del PDF confirma cobertura ('SI REGISTRA COBERTURA'). Si
-    ninguna fila la confirma, devuelve None (sin seguro / indeterminado).
+    """Devuelve 'CAMPESINO' o 'IESS' si la fila IESS de la tabla del PDF
+    dice 'SI REGISTRA COBERTURA'. En cualquier otro caso devuelve None
+    (no se sube a ninguna carpeta). ISSFA e ISSPOL NO se toman en cuenta.
 
     es_campesino_fn: pasar core.es_campesino."""
     t = _quitar_tildes(texto_pdf or "").upper()
-
-    if _estado_fila(t, "ISSFA", "ISSPOL") is True:
-        return "ISSFA"
-    if _estado_fila(t, "ISSPOL", "RED PRIVADA") is True:
-        return "ISSPOL"
     if _estado_fila(t, "IESS", "ISSFA") is True:
         return "CAMPESINO" if es_campesino_fn(texto_pdf) else "IESS"
     return None

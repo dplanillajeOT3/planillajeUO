@@ -11,7 +11,7 @@ Y drive_utils.py para:
   - Login por unidad (st.secrets["usuarios"])
   - Bajar el INSTRUCTIVO del mes actual desde Drive al iniciar sesion
   - Subir la matriz + clasificar y subir cada PDF a IESS/CAMPESINO/
-    ISSFA/ISSPOL dentro de PLANILLAJE COBERTURAS/<unidad>/<año>/<mes>
+    dentro de PLANILLAJE COBERTURAS/<unidad>/<año>/<mes>
 
 REQUISITOS (junto a este archivo, descargar_coberturas.py y drive_utils.py):
 
@@ -230,7 +230,7 @@ def _sincronizar_con_drive():
                     )
                     subidos += 1
 
-    mensaje = f"✅ Sincronizado: {subidos} PDF(s) subidos a IESS/CAMPESINO/ISSFA/ISSPOL y matriz actualizada en Drive."
+    mensaje = f"✅ Sincronizado: {subidos} PDF(s) subidos a IESS/CAMPESINO y matriz actualizada en Drive."
     st.success(mensaje)
     if sin_clasificar:
         st.warning(
@@ -329,6 +329,36 @@ with col_sesion:
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
+
+def _diagnostico_red():
+    """Prueba, DESDE EL SERVIDOR de la nube, si llegan los sitios que usa
+    el motor, y con que IP/pais sale a internet. Sirve para confirmar si
+    coberturasalud.msp.gob.ec esta bloqueando la IP del servidor."""
+    import requests
+
+    sitios = {
+        "CoreSalud (MSP)": core.URL_CORESALUD,
+        "IESS calificación": core.URL_IESS_CALIFICACION,
+    }
+    for nombre, url in sitios.items():
+        try:
+            r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            st.write(f"✅ **{nombre}**: respondió HTTP {r.status_code}")
+        except Exception as e:
+            st.write(f"❌ **{nombre}**: {type(e).__name__}: {str(e)[:200]}")
+
+    try:
+        info = requests.get("https://ipinfo.io/json", timeout=15).json()
+        st.write(f"🌐 El servidor sale a internet con la IP **{info.get('ip')}** "
+                 f"({info.get('city')}, {info.get('country')} - {info.get('org')})")
+    except Exception as e:
+        st.write(f"No se pudo consultar la IP de salida: {e}")
+
+
+with st.expander("🔌 Diagnóstico de conexión (CoreSalud / IESS)"):
+    if st.button("Probar conexión desde el servidor"):
+        with st.spinner("Probando..."):
+            _diagnostico_red()
 
 hay_matriz = _asegurar_matriz_desde_drive()
 if not hay_matriz:
